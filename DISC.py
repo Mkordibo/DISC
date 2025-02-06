@@ -926,10 +926,10 @@ class DISC(BinarizedWatermark):
                 context.append(token_id & 1)
 
             # Map back from permuted ID to the real vocabulary ID
-                if flagPerm:
-                    real_token_id = inv_perm[token_id]
-                else:
-                    real_token_id = token_id  
+            if flagPerm:
+                real_token_id = inv_perm[token_id]
+            else:
+                real_token_id = token_id  
             
             # Negative log-likelihood
             empentropy.append(-math.log(probs[token_id] + 1e-15))
@@ -972,7 +972,37 @@ class OZWatermark(BinarizedWatermark):
     Implements the OZ watermarking method for multi-bit steganography 
     using a binarized language model.
     """
+    @staticmethod
+    def normalize_score(score, length):
+        return (score - length)/math.sqrt(length)
+    
+    @staticmethod
+    def compute_score_function(key, prf_input, bit):
+        """
+        This function calculates the score function for a binary bit and a payload value
+        
 
+        Parameters
+        ----------
+        key : TYPE
+            secret key shared between encoder and decoder.
+        prf_input : [i, ind , s], 
+            i: indx of the real token
+            ind: indx of the binary token
+            s: codeword symbole ('0','1','<').
+        bit : str
+            binary tokne ('0' or '1').
+
+        Returns
+        -------
+        float
+            score value, s(w^b_i, y_i, S).
+
+        """
+        u = PRF(key, prf_input)
+        v = (u if bit == '1' else (1-u))
+        return -math.log(v)
+    
     def generate(
         self, 
         key, 
@@ -985,6 +1015,7 @@ class OZWatermark(BinarizedWatermark):
         Rlambda=5, 
         flagR=False, 
         h=4, 
+        flagPerm=False,
         verbose=True
     ):
         """
@@ -1033,7 +1064,10 @@ class OZWatermark(BinarizedWatermark):
 
         # Setup permutation
         vocab_size = len(self.tokenizer)
-        perm, inv_perm = consistent_perm(key, vocab_size)
+        perm, inv_perm = consistent_perm(key, vocab_size) # Not necessary, but makes the token indices spread uniformly.
+        # This is done for assigning binary numbers of length blen to the tokens, for 
+        # example should 0000 mean the first token of the tokenizer? If we use this permutation
+        # then 0000 might refer the 100th token of the tokenizer
 
         # Retrieve blen from parent class
         blen = self.blen
@@ -1043,7 +1077,7 @@ class OZWatermark(BinarizedWatermark):
 
         # Initialize ECC (Error Correcting Code for steganography)
         ecc = DynamicECC(payload)
-        symbol = ecc.next_symbol()
+        symbol = ecc.next_symbol() # symbol is the next symbol that decoder sends
 
         scores = {'0': 0, '1': 0, '<': 0}
         score_length = 0
@@ -1051,7 +1085,7 @@ class OZWatermark(BinarizedWatermark):
         lapsedt = []
 
         # Generation loop
-        for i in range(length):  
+        for i in range(length):  # list of real tokens
             with torch.no_grad():
                 if past:
                     output = self.model(
@@ -1065,17 +1099,20 @@ class OZWatermark(BinarizedWatermark):
                 output.logits[:, -1, : vocab_size] / temperature, dim=-1
             ).cpu()[0, :]
 
-            # Apply permutation to the probabilities
-            probs_permed = apply_perm(probs, perm)
+            # Apply permutation to the distribution
+            if flagPerm:
+                probs = apply_perm(probs, perm)
 
             token_id = 0
             for ind in range(blen):  
                 st = time.time()
-                p0, p1 = self._binarize_next(probs_permed, ind, blen, token_id)
+                p0, p1 = self._binarize_next(probs, ind, blen, token_id)
                 et = time.time()
                 lapsedt.append(et - st)
 
-                token_id <<= 1  
+                token_id <<= 1  # token_id is the indx of the overall real token 
+                # that is generated so far in permuted tokens, eventually it will be the indx of the real token,
+                # corresponding to the blen binary tokens 
 
                 P1 = p1.item() / (p0.item() + p1.item())
 
@@ -1096,38 +1133,41 @@ class OZWatermark(BinarizedWatermark):
 
                 # PRF-based sampling phase
                 elif flagRchosen and flagR:
-                    if PRF(key, R + [i, ind, symbol]) < P1:
-                        token_id += 1
-                else:
-                    if PRF(key, [i, ind, symbol]) < P1:
-                        token_id += 1
+                    if PRF(key, R + [i, ind, symbol]) < P1: # this is y_j < Pj(1)
+                        token_id += 1  # w^b_j = 1 
+                elif not flagR:
+                    if PRF(key, [i, ind, symbol]) < P1: # this is y_j < Pj(1)
+                        token_id += 1 # w^b_j = 1 
 
                 # Score tracking for ECC decoding
                 if (not bit_limit) or (ind < bit_limit):
                     score_length += 1
                     for s in ['0', '1', '<']:
                         if flagR and not flagRchosen:
-                            scores[s] += compute_score_function(
+                            scores[s] += self.compute_score_function(
                                 key, [i, ind, s], str(token_id % 2)
                             )
                         elif flagRchosen and flagR:
-                            scores[s] += compute_score_function(
+                            scores[s] += self.compute_score_function(
                                 key, R + [i, ind, s], str(token_id % 2)
                             )
-                        else:
-                            scores[s] += compute_score_function(
+                        elif not flagR:
+                            scores[s] += self.compute_score_function(
                                 key, [i, ind, s], str(token_id % 2)
                             )
 
-                        if normalize_score(scores[s], score_length) > threshold:
+                        if self.normalize_score(scores[s], score_length) > threshold:
                             ecc.update(s)
                             symbol = ecc.next_symbol()
                             scores = {'0': 0, '1': 0, '<': 0}
                             score_length = 0
                             break
 
-            # Convert the generated token back to the original vocabulary
-            real_token_id = inv_perm[token_id]
+            # Map back from permuted ID to the real vocabulary ID
+            if flagPerm:
+                real_token_id = inv_perm[token_id]
+            else:
+                real_token_id = token_id  
             token = torch.tensor([[real_token_id]], device=self.model.device)
             prompt_ids = torch.cat([prompt_ids, token], dim=-1)
 
