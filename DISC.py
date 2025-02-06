@@ -44,7 +44,7 @@ from sentence_transformers import SentenceTransformer
 
 from dynamic_ecc import DynamicECC
 from utils import PRF, start_model, consistent_perm, \
-        apply_perm, entropyfnc, int2gray, gray2int
+        apply_perm, entropyfnc, int2gray, gray2int, strbintobin
 from compact_text import CompactText
 
 ###############################################
@@ -793,8 +793,11 @@ class DISC(BinarizedWatermark):
         # --------------------------------------------------
         # 1) Convert integer -> Gray code
         # 2) Scale by 1 / 2^m_bits
-        gray_val = int2gray(payload)  # e.g. if payload=5, then gray_val will be 7
-        deltaM = gray_val / float(max_val)
+        if payload != []:
+            gray_val = int2gray(payload)  # e.g. if payload=5, then gray_val will be 7
+            deltaM = gray_val / float(max_val)
+        else:
+            deltaM = 0    
 
         if verbose:
             print(f"DISC: m_bits={m_bits}, message={payload}, gray={gray_val}, deltaM={deltaM}")
@@ -823,10 +826,17 @@ class DISC(BinarizedWatermark):
                 context.extend(bits_of_tk)
         else:
             # If prompt shorter than h, just fill with zeros
-            context = [0] * (h * blen)
-        context = []
-        for indcontext in range(-h,0):
-            context = context + strbintobin(list("0"*blen + bin(perm[inputs[:,indcontext][0]])[2:])[-blen:]) 
+            context = [0] * ((h - prompt_len_tkn) * blen)
+            for tk in prompt_len_tkn.tolist():
+                # E.g. bin(perm[tk]) -> string, ensure we only keep 'blen' bits
+                if flagPerm:
+                    tk_idx = perm[tk]
+                else:
+                    tk_idx = tk      
+                # We assume strbintobin is a utility that converts integer 
+                # to a binary string, ensuring length=blen.
+                bits_of_tk = strbintobin( bin(tk_idx)[2:], blen=blen )
+                context.extend(bits_of_tk)
         # --------------------------------------------------
         # Generation Loop
         # --------------------------------------------------
@@ -854,16 +864,19 @@ class DISC(BinarizedWatermark):
             entropy_list.append(entropyfnc(probs.tolist()))
 
             # Apply permutation to the distribution
-            probs_permed = apply_perm(probs, perm)
+            if flagPerm:
+                probs = apply_perm(probs, perm)
 
             # Combine bits to form the next token
             token_id = 0
             for bit_ind in range(blen):
                 # Partial prob for bit=0 or 1
-                p0, p1 = binarize_next(probs_permed, bit_ind, blen, token_id)
+                p0, p1 = self._binarize_next(probs, bit_ind, blen, token_id)
                 token_id <<= 1
 
-                P1 = p1.item() / (p0.item() + p1.item())
+                p0_val = p0.item()
+                p1_val = p1.item()
+                P1 = p1_val / (p0_val + p1_val) if (p0_val + p1_val) > 0 else 0.0
                 P1vec.append(P1)
 
                 if (flagR and not flagRchosen):
@@ -912,10 +925,14 @@ class DISC(BinarizedWatermark):
                     context.pop(0)
                 context.append(token_id & 1)
 
-            # Map from permuted ID to real vocab ID
-            real_token_id = inv_perm[token_id]
+            # Map back from permuted ID to the real vocabulary ID
+                if flagPerm:
+                    real_token_id = inv_perm[token_id]
+                else:
+                    real_token_id = token_id  
+            
             # Negative log-likelihood
-            empentropy.append(-math.log(probs_permed[token_id] + 1e-15))
+            empentropy.append(-math.log(probs[token_id] + 1e-15))
 
             # Add the new token
             token_t = torch.tensor([[real_token_id]], device=self.model.device)
@@ -927,16 +944,6 @@ class DISC(BinarizedWatermark):
                 dim=-1
             )
 
-        # Compute remainder of the entropy over tokens
-        # (Mean of first n//blen items, etc.)
-        if n >= blen:
-            # Rementropy = average over first (n//blen) tokens
-            rem_entropy_count = n // blen
-            rementropy_vals = empentropy[:rem_entropy_count] if rem_entropy_count <= len(empentropy) else empentropy
-            Rementropy = statistics.mean(rementropy_vals) if rementropy_vals else 0.0
-        else:
-            Rementropy = 0.0
-
         if verbose:
             wtokens = prompt_ids[0][prompt_len_tkn:].tolist()
             print("Watermarked tokens are:", wtokens)
@@ -945,26 +952,10 @@ class DISC(BinarizedWatermark):
         new_token_ids = prompt_ids[0][prompt_len_tkn:].cpu()
         generated_text = self._detokenize(new_token_ids)
 
-        # If detailedData, optionally return the same raw data
-        if detailedData:
-            return (
-                generated_text,
-                new_token_ids.tolist(),
-                P1vec,
-                Y,
-                entropy_list,
-                empentropy,
-                statistics.mean(entropy_list) if entropy_list else None,
-                statistics.mean(empentropy) if empentropy else None,
-                Rementropy,
-                n
-            )
-        else:
-            # Otherwise, build a BinarizedWatermarkedText
-            mean_entropy = statistics.mean(entropy_list) if entropy_list else None
-            mean_emp_entropy = statistics.mean(empentropy) if empentropy else None
+        mean_entropy = statistics.mean(entropy_list) if entropy_list else None
+        mean_emp_entropy = statistics.mean(empentropy) if empentropy else None
 
-            return BinarizedWatermarkedText(
+        return BinarizedWatermarkedText(
                 text=generated_text,
                 token_ids=new_token_ids.tolist(),
                 p1_values=P1vec,
@@ -974,4 +965,191 @@ class DISC(BinarizedWatermark):
                 avg_entropy=mean_entropy,
                 avg_emp_entropy=mean_emp_entropy,
                 n=n
-            )
+        )
+    
+class OZWatermark(BinarizedWatermark):
+    """
+    Implements the OZ watermarking method for multi-bit steganography 
+    using a binarized language model.
+    """
+
+    def generate(
+        self, 
+        key, 
+        prompt, 
+        payload, 
+        length=30, 
+        threshold=2, 
+        bit_limit=None, 
+        temperature=1.0, 
+        Rlambda=5, 
+        flagR=False, 
+        h=4, 
+        verbose=True
+    ):
+        """
+        Generate a steganographic response that embeds the given payload.
+
+        Parameters
+        ----------
+        key : any
+            Secret key shared between encoder and decoder.
+        prompt : str
+            The input prompt for text generation.
+        payload : list of bits
+            The binary message to be embedded.
+        length : int, optional
+            Number of real tokens to generate.
+        threshold : int, optional
+            Used to determine chunk length for hiding symbols.
+        bit_limit : int, optional
+            Limit on binary bits per token used for embedding.
+        temperature : float, optional
+            Softmax temperature for sampling.
+        Rlambda : float, optional
+            Threshold for switching from random sampling to PRF-based sampling.
+        flagR : bool, optional
+            If True, uses bit-tracking mechanism.
+        h : int, optional
+            Context size in tokens.
+        verbose : bool, optional
+            If True, prints debug info.
+
+        Returns
+        -------
+        BinarizedWatermarkedText
+            The generated watermarked text, along with ECC encoding information.
+        """
+        flagRchosen = False
+        H = 0
+        n = 0
+        R = []
+
+        # Tokenize the prompt
+        prompt_ids = self._tokenize(prompt).to(self.model.device)
+        prompt_len_tkn = prompt_ids.shape[1]
+
+        attn = torch.ones_like(prompt_ids)
+
+        # Setup permutation
+        vocab_size = len(self.tokenizer)
+        perm, inv_perm = consistent_perm(key, vocab_size)
+
+        # Retrieve blen from parent class
+        blen = self.blen
+
+        if bit_limit:
+            assert bit_limit <= blen, "bit_limit cannot exceed blen"
+
+        # Initialize ECC (Error Correcting Code for steganography)
+        ecc = DynamicECC(payload)
+        symbol = ecc.next_symbol()
+
+        scores = {'0': 0, '1': 0, '<': 0}
+        score_length = 0
+        past = None
+        lapsedt = []
+
+        # Generation loop
+        for i in range(length):  
+            with torch.no_grad():
+                if past:
+                    output = self.model(
+                        prompt_ids[:, -1:], past_key_values=past, attention_mask=attn
+                    )
+                else:
+                    output = self.model(prompt_ids)
+
+            # Apply temperature to logits before softmax
+            probs = torch.nn.functional.softmax(
+                output.logits[:, -1, : vocab_size] / temperature, dim=-1
+            ).cpu()[0, :]
+
+            # Apply permutation to the probabilities
+            probs_permed = apply_perm(probs, perm)
+
+            token_id = 0
+            for ind in range(blen):  
+                st = time.time()
+                p0, p1 = self._binarize_next(probs_permed, ind, blen, token_id)
+                et = time.time()
+                lapsedt.append(et - st)
+
+                token_id <<= 1  
+
+                P1 = p1.item() / (p0.item() + p1.item())
+
+                # Randomized sampling phase
+                if flagR and not flagRchosen:
+                    if random.random() < P1:
+                        token_id += 1
+                        H -= math.log(P1)
+                    else:
+                        H -= math.log(1 - P1)
+                    n += 1
+                    R.append(token_id % 2)
+
+                    if H >= Rlambda and n > h * blen:
+                        flagRchosen = True
+                        if verbose:
+                            print(f"OZWatermark: Threshold reached, n={n}, R={R}")
+
+                # PRF-based sampling phase
+                elif flagRchosen and flagR:
+                    if PRF(key, R + [i, ind, symbol]) < P1:
+                        token_id += 1
+                else:
+                    if PRF(key, [i, ind, symbol]) < P1:
+                        token_id += 1
+
+                # Score tracking for ECC decoding
+                if (not bit_limit) or (ind < bit_limit):
+                    score_length += 1
+                    for s in ['0', '1', '<']:
+                        if flagR and not flagRchosen:
+                            scores[s] += compute_score_function(
+                                key, [i, ind, s], str(token_id % 2)
+                            )
+                        elif flagRchosen and flagR:
+                            scores[s] += compute_score_function(
+                                key, R + [i, ind, s], str(token_id % 2)
+                            )
+                        else:
+                            scores[s] += compute_score_function(
+                                key, [i, ind, s], str(token_id % 2)
+                            )
+
+                        if normalize_score(scores[s], score_length) > threshold:
+                            ecc.update(s)
+                            symbol = ecc.next_symbol()
+                            scores = {'0': 0, '1': 0, '<': 0}
+                            score_length = 0
+                            break
+
+            # Convert the generated token back to the original vocabulary
+            real_token_id = inv_perm[token_id]
+            token = torch.tensor([[real_token_id]], device=self.model.device)
+            prompt_ids = torch.cat([prompt_ids, token], dim=-1)
+
+            past = output.past_key_values
+            attn = torch.cat([attn, attn.new_ones((attn.shape[0], 1))], dim=-1)
+
+            # Check if the full payload has been decoded
+            if DynamicECC.decode(ecc.stream)[:len(payload)] == payload:
+                generated_text = self._detokenize(prompt_ids[0][prompt_len_tkn:])
+                return BinarizedWatermarkedText(
+                    text=generated_text,
+                    token_ids=prompt_ids[0][prompt_len_tkn:].tolist(),
+                    embedded_message=payload,
+                    decoded_message=DynamicECC.decode(ecc.stream)
+                )
+
+        # If payload is not fully embedded, return the generated text anyway
+        generated_text = self._detokenize(prompt_ids[0][prompt_len_tkn:])
+        return BinarizedWatermarkedText(
+            text=generated_text,
+            token_ids=prompt_ids[0][prompt_len_tkn:].tolist(),
+            embedded_message=payload,
+            decoded_message=DynamicECC.decode(ecc.stream)
+        )
+
