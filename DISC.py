@@ -47,6 +47,7 @@ from utils import PRF, start_model, consistent_perm, \
         apply_perm, entropyfnc, int2gray, gray2int, strbintobin
 from compact_text import CompactText
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class Text:
     """
     A base container class for text data, possibly watermarked or not.
@@ -58,6 +59,8 @@ class Text:
         prompt=None,
         text=None,
         token_ids=None,
+        generation_key=None,
+        detection_key=None,
         random_values=None,
         random_values_at_decode=None,
         watermarked=False,
@@ -81,6 +84,10 @@ class Text:
             The generated text.
         token_ids : list of int, optional
             The token IDs associated with the text.
+        generation_key : any, optional
+            Key used for generation.    
+        detection_key : any, optional
+            Key used for detection.
         random_values : list of float, optional
             Random draws used for each bit (if any).
         watermarked : bool, optional
@@ -105,6 +112,8 @@ class Text:
         self.prompt = prompt
         self.text = text
         self.token_ids = token_ids or []
+        self.generation_key = generation_key
+        self.detection_key = detection_key
         self.random_values = random_values or []
         self.random_values_at_decode = random_values_at_decode or []
         self.watermarked = watermarked
@@ -155,9 +164,11 @@ class BinarizedText(Text):
         # Use the fields from text_obj and add P1
         return cls(
             P1=P1,
+            prompt=text_obj.prompt,
             text=text_obj.text,
             token_ids=text_obj.token_ids,
             random_values=text_obj.random_values,
+            random_values_at_decode=text_obj.random_values_at_decode,
             watermarked=text_obj.watermarked,
             score=text_obj.score,
             normalized_score=text_obj.normalized_score,
@@ -167,6 +178,9 @@ class BinarizedText(Text):
             p_value=text_obj.p_value,
             best_p_value=text_obj.best_p_value,
             decoded_message=text_obj.decoded_message,
+            generation_key=text_obj.generation_key,
+            detection_key=text_obj.detection_key
+
         )
     @classmethod
     def from_binarized_watermarked_text(cls, bwt_obj):
@@ -187,9 +201,11 @@ class BinarizedText(Text):
             # BinarizedText-specific field
             P1=bwt_obj.P1,
             # Fields inherited from Text
+            prompt=bwt_obj.prompt,
             text=bwt_obj.text,
             token_ids=bwt_obj.token_ids,
             random_values=bwt_obj.random_values,
+            random_values_at_decode=bwt_obj.random_values_at_decode,
             watermarked=bwt_obj.watermarked,
             score=bwt_obj.score,
             normalized_score=bwt_obj.normalized_score,
@@ -198,7 +214,9 @@ class BinarizedText(Text):
             best_normalized_score=bwt_obj.best_normalized_score,
             p_value=bwt_obj.p_value,
             best_p_value=bwt_obj.best_p_value,
-            decoded_message=bwt_obj.decoded_message
+            decoded_message=bwt_obj.decoded_message,
+            generation_key=bwt_obj.generation_key,
+            detection_key=bwt_obj.detection_key
         )    
 
 class WatermarkedText(Text):
@@ -214,6 +232,8 @@ class WatermarkedText(Text):
         avg_entropy=None,
         avg_emp_entropy=None,
         embedded_message=None,
+        detection_key=None,
+        watermarked_tkns=None,
         **kwargs
     ):
         """
@@ -227,13 +247,18 @@ class WatermarkedText(Text):
             Average empirical entropy.
         embedded_message : str, optional
             Any embedded watermark message.
+        detection_key : any, optional
+            Key used for detection.
+        watermarked_tkns : list of int, optional
+            Indices of tokens marked as watermarked.    
         """
         self.entropies = entropies or []
         self.empirical_entropies = empirical_entropies or []
         self.avg_entropy = avg_entropy
         self.avg_emp_entropy = avg_emp_entropy
         self.embedded_message = embedded_message
-
+        self.detection_key = detection_key
+        self.watermarked_tkns = watermarked_tkns or []
         # Continue up the MRO chain
         super().__init__(**kwargs)
 
@@ -245,7 +270,9 @@ class WatermarkedText(Text):
         empirical_entropies=None,
         avg_entropy=None,
         avg_emp_entropy=None,
-        embedded_message=None
+        embedded_message=None,
+        detection_key=None,
+        watermarked_tkns=None,
     ):
         """
         Create a WatermarkedText from an existing Text object.
@@ -264,6 +291,10 @@ class WatermarkedText(Text):
             Average empirical entropy.
         embedded_message : str, optional
             The embedded watermark message.
+        detection_key : any, optional
+            Key used for detection.
+        watermarked_tkns : list of int, optional
+            Indices of tokens marked as watermarked.    
 
         Returns
         -------
@@ -275,9 +306,13 @@ class WatermarkedText(Text):
             avg_entropy=avg_entropy,
             avg_emp_entropy=avg_emp_entropy,
             embedded_message=embedded_message,
+            detection_key=detection_key,
+            watermarked_tkns=watermarked_tkns,
+            prompt=text_obj.prompt,
             text=text_obj.text,
             token_ids=text_obj.token_ids,
             random_values=text_obj.random_values,
+            random_values_at_decode=text_obj.random_values_at_decode,
             watermarked=text_obj.watermarked,
             score=text_obj.score,
             normalized_score=text_obj.normalized_score,
@@ -287,6 +322,7 @@ class WatermarkedText(Text):
             p_value=text_obj.p_value,
             best_p_value=text_obj.best_p_value,
             decoded_message=text_obj.decoded_message,
+            generation_key=text_obj.generation_key,
         )    
 
 class BinarizedWatermarkedText(BinarizedText, WatermarkedText):
@@ -295,7 +331,7 @@ class BinarizedWatermarkedText(BinarizedText, WatermarkedText):
     in a cooperative multiple inheritance manner.
     """
 
-    def __init__(self, n=None, watermarked_tkns=None, **kwargs):
+    def __init__(self, n=None, watermarked_btkns=None, **kwargs):
         """
         n : int, optional
             Extra field, e.g. number of bits used before switching from random sampling.
@@ -303,7 +339,7 @@ class BinarizedWatermarkedText(BinarizedText, WatermarkedText):
             Indices or token IDs specifically marked as watermarked.
         """
         self.n = n or 0
-        self.watermarked_tkns = watermarked_tkns or []
+        self.watermarked_btkns = watermarked_btkns or []
 
         # Use super() to traverse MRO in a single chain
         super().__init__(**kwargs)
@@ -317,7 +353,7 @@ class BinarizedWatermarkedText(BinarizedText, WatermarkedText):
         avg_emp_entropy=None,
         embedded_message=None,
         n=None,
-        watermarked_tkns=None,
+        watermarked_btkns=None,
     ):
         """
         Convert a BinarizedText into a BinarizedWatermarkedText by adding
@@ -337,13 +373,15 @@ class BinarizedWatermarkedText(BinarizedText, WatermarkedText):
             p_value=bin_text_obj.p_value,
             best_p_value=bin_text_obj.best_p_value,
             decoded_message=bin_text_obj.decoded_message,
+            generaion_key=bin_text_obj.generation_key,
+            detection_key=bin_text_obj.detection_key,
             entropies=entropies,
             empirical_entropies=empirical_entropies,
             avg_entropy=avg_entropy,
             avg_emp_entropy=avg_emp_entropy,
             embedded_message=embedded_message,
             n=n,
-            watermarked_tkns=watermarked_tkns,
+            watermarked_btkns=watermarked_btkns,
         )
 
     @classmethod
@@ -352,7 +390,7 @@ class BinarizedWatermarkedText(BinarizedText, WatermarkedText):
         wtr_text_obj,
         P1=None,
         n=None,
-        watermarked_tkns=None,
+        watermarked_btkns=None,
     ):
         """
         Convert a WatermarkedText into a BinarizedWatermarkedText by adding
@@ -376,9 +414,11 @@ class BinarizedWatermarkedText(BinarizedText, WatermarkedText):
             avg_entropy=wtr_text_obj.avg_entropy,
             avg_emp_entropy=wtr_text_obj.avg_emp_entropy,
             embedded_message=wtr_text_obj.embedded_message,
+            detection_key=wtr_text_obj.detection_key,
+            watermarked_tkns=wtr_text_obj.watermarked_tkns,
             P1=P1,
             n=n,
-            watermarked_tkns=watermarked_tkns,
+            watermarked_btkns=watermarked_btkns,
         )
 
     @classmethod
@@ -393,6 +433,7 @@ class BinarizedWatermarkedText(BinarizedText, WatermarkedText):
         embedded_message=None,
         n=None,
         watermarked_tkns=None,
+        watermarked_btkns=None
     ):
         """
         Convert a plain Text into a BinarizedWatermarkedText directly,
@@ -411,14 +452,17 @@ class BinarizedWatermarkedText(BinarizedText, WatermarkedText):
             p_value=text_obj.p_value,
             best_p_value=text_obj.best_p_value,
             decoded_message=text_obj.decoded_message,
+            generation_key=text_obj.generation_key,
+            detection_key=text_obj.detection_key,
+            watermarked_tkns=watermarked_tkns,
+            watermarked_btkns=watermarked_btkns,
             P1=P1,
             entropies=entropies,
             empirical_entropies=empirical_entropies,
             avg_entropy=avg_entropy,
             avg_emp_entropy=avg_emp_entropy,
             embedded_message=embedded_message,
-            n=n,
-            watermarked_tkns=watermarked_tkns,
+            n=n
         )
 
 ###############################################
@@ -429,7 +473,13 @@ class BinarizedLLM:
     This class wraps a language model and a tokenizer to generate text in a 'binarized' fashion.
     """
 
-    def __init__(self, model, tokenizer):
+    def __init__(self,
+                model, 
+                tokenizer,
+                max_gen_len: int,
+                temperature: float = 0.8,
+                top_p: float = 0.95
+                ):
         """
         Initialize with a model and its tokenizer.
         
@@ -440,8 +490,15 @@ class BinarizedLLM:
         tokenizer : PreTrainedTokenizer
             The tokenizer corresponding to the model.
         """
+        # model config
+        self.max_seq_len = model.config.max_sequence_length
+        self.pad_id = model.config.pad_token_id
+        self.eos_id = model.config.eos_token_id
         self.model = model
         self.tokenizer = tokenizer
+        self.temerature = temperature
+        self.top_p = top_p
+        self.max_gen_len = max_gen_len
         # Setup for binarization: pre-compute the number of bits needed, 
         # plus token <-> id dictionaries.
         self.blen, self.token_to_id, self.id_to_token = self._setup_binarization()
@@ -488,20 +545,38 @@ class BinarizedLLM:
             tokens = self._tokenize(text)[0][skip_prefix:]
         return tokens.tolist()
     
-    def _tokenize(self, text):
+    def _tokenize(self, 
+                prompts: List[str]
+                ) -> torch.tensor:
+        
         """
         Tokenize a text prompt into model-ready format.
         
         Parameters
         ----------
-        text : str
-            The text prompt to tokenize.
+        prompt : str
+            The prompt to tokenize.
         Returns
         -------
         torch.Tensor
             The tokenized prompt as a PyTorch tensor (batch dimension included).
         """
-        return self.tokenizer.encode(text, return_tensors='pt', truncation=True, max_length=2048)
+        # bsz = len(prompts) # batch size 
+        # prompt_tokens = [self.tokenizer.encode(x, 
+        #                              return_tensors='pt', 
+        #                              truncation=True, 
+        #                              add_special_tokens=False,
+        #                              max_length=self.max_seq_len)
+        #                             for x in prompts]
+        # min_prompt_size = min([len(t) for t in prompt_tokens])
+        # max_prompt_size = max([len(t) for t in prompt_tokens])
+        # total_len = min(self.max_seq_len, self.max_gen_len + max_prompt_size)
+        return self.tokenizer.encode(prompts, 
+                                     return_tensors='pt', 
+                                     truncation=True, 
+                                     add_special_tokens=False,
+                                     max_length=self.max_seq_len)
+                                   
 
     def _detokenize(self, token_ids):
         """
@@ -557,109 +632,196 @@ class BinarizedLLM:
         return p0, p1
 
     def generate(self, 
-                          prompt, 
-                          length=30):
+             prompts: List[str],
+             max_gen_len: int = 30, 
+             length=30,
+             temperature: float = 0.8,
+             top_p: float = 0.95,
+             return_debug: bool = False) -> List[BinarizedText]:
         """
-        Generate a response in a binarized manner, building tokens 
-        from bits determined by random draws from p0/p1.
-
+        Generate a batch of binarized text responses.
+        
         Parameters
         ----------
-        prompt : str
-            The text prompt to initiate generation.
-        length : int, optional
-            Number of real tokens (not bits) to generate.
-        
+        prompts : List[str]
+            A batch of text prompts for generation.
+        max_gen_len : int
+            Maximum number of tokens to generate per prompt.
+        length : int
+            Number of real tokens to generate (not bits).
+        temperature : float
+            Controls randomness in sampling.
+        top_p : float
+            Nucleus sampling threshold.
+        return_debug : bool, optional
+            If True, also returns P1 values and random draws.
+
         Returns
         -------
-        BinarizedText
-            An object holding the final text, the list of p1 for each token, 
-            the list of random draws used, list of token ids.
-        """
-        # --- Prepare prompt ---
-        prompt_ids = self._tokenize(prompt).to(self.model.device)
-        prompt_len = len(prompt_ids[0])
-        
-        # We maintain an attention mask for some models 
-        # (e.g. GPT-like models).
-        attn_mask = torch.ones_like(prompt_ids)
+        List[BinarizedText]
+            A list of BinarizedText objects containing the generated text,
+            token IDs, and optionally P1 values and random draws.
+    """
+        bsz = len(prompts) # batch size 
+        prompt_tokens = [self.tokenizer.encode(x, add_special_tokens=False) for x in prompts]
+        min_prompt_size = min([len(t) for t in prompt_tokens])
+        max_prompt_size = max([len(t) for t in prompt_tokens])
+        total_len = min(self.max_seq_len, max_gen_len + max_prompt_size)
 
-        # We'll store p1 for each bit, plus the random draws.
-        P1 = []
-        random_values_all = []
+        tokens = torch.full((bsz, total_len), self.pad_id).to(device).long()
+        for k, t in enumerate(prompt_tokens):
+            tokens[k, : len(t)] = torch.tensor(t).to(device).long()
+            # Initialize attention mask as a PyTorch tensor
+        attn_mask = torch.zeros((bsz, total_len), dtype=torch.bool, device=device)
+        for k, t in enumerate(prompt_tokens):
+            attn_mask[k, : len(t)] = 1  # Mark prompt tokens as valid
+        input_text_mask = tokens != self.pad_id
 
-        # We keep track of the 'past' (cache of key/values) 
-        # so that we don't recompute the entire sequence each time.
-        past = None
+        # Initialize lists to store output information
+        generated_texts = []
+        all_token_ids = []
+        P1_values = [[] for _ in range(bsz)] if return_debug else None
+        random_values_all = [[] for _ in range(bsz)] if return_debug else None
 
-        # Generate 'length' real tokens (each requires 'blen' bits).
-        for _ in range(length):
-            with torch.no_grad():
-                # If we already have a 'past', only feed the last token.
-                if past is not None:
-                    output = self.model(
-                        prompt_ids[:, -1:], 
-                        past_key_values=past, 
-                        attention_mask=attn_mask
-                    )
-                else:
-                    output = self.model(prompt_ids)
-
-            # Softmax over the known vocab range.
-            probs = torch.nn.functional.softmax(
-                output.logits[:, -1, :len(self.tokenizer)], dim=-1
-            ).cpu()[0, :]
-
-            # We combine bits to determine the next token.
-            token_id = 0
-            for bit_index in range(self.blen):
-                # Compute p0 and p1 for this bit.
-                p0, p1 = self._binarize_next(probs, bit_index, self.blen, token_id)
-                # Store them for analysis
-                P1.append(p1.item())
-
-                # Randomly pick 0 or 1
-                rand_val = random.random()
-                random_values_all.append(rand_val)
-
-                p0_val = p0.item()
-                p1_val = p1.item()
-                total = p0_val + p1_val
-                prob_bit_1 = (p1_val / total) if total > 0 else 0
-
-                # Shift the bits in token_id left by 1 
-                # (making room for the new bit).
-                token_id <<= 1
-
-                # If our random draw is below prob_bit_1, 
-                # set this bit to 1.
-                if rand_val < prob_bit_1:
-                    token_id += 1
-
-            # Now we have a complete token ID from the bits.
-            token_tensor = torch.tensor([[token_id]]).to(self.model.device)
-
-            # Append the new token to our prompt
-            prompt_ids = torch.cat([prompt_ids, token_tensor], dim=-1)
-            # Update the past and attention mask
-            past = output.past_key_values
-            attn_mask = torch.cat(
-                [attn_mask, attn_mask.new_ones((attn_mask.shape[0], 1))], dim=-1
+        start_pos = min_prompt_size
+        prev_pos = 0
+        for cur_pos in range(start_pos, total_len):
+            outputs = self.model.forward(
+                tokens[:, prev_pos:cur_pos],
+                use_cache=True,
+                past_key_values=outputs.past_key_values if prev_pos > 0 else None,
+                attention_mask=attn_mask[:, :cur_pos]  # Apply updated attention mask
             )
+            ngram_tokens = tokens[:, cur_pos-self.ngram:cur_pos]
+            next_toks, P1_batch, rand_vals_batch  = self.sample_next(outputs.logits[:, -1, :], 
+                                        ngram_tokens,
+                                        temperature,
+                                        top_p,
+                                        return_debug)
+            tokens[:, cur_pos] = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_toks)
+            # Update attention mask for newly generated tokens
+            attn_mask[:, cur_pos] = 1  # Mark new tokens as valid for attention
+            prev_pos = cur_pos
 
-        # Convert the entire sequence of token IDs back to text
-        generated_ids = prompt_ids[0].detach().cpu()
-        # We only want the newly generated portion (skip the original prompt)
-        new_tokens_ids = generated_ids[prompt_len:]
-        generated_text = self._detokenize(new_tokens_ids)
+            # Store debug values if requested
+            if return_debug:
+                for i in range(bsz):
+                    P1_values[i].extend(P1_batch[i])
+                    random_values_all[i].extend(rand_vals_batch[i])
 
-        return BinarizedText(
-            text=generated_text,
-            P1=P1,
-            random_values=random_values_all,
-            token_ids=new_tokens_ids.tolist(),
-            watermarked = False
-        )
+        # Convert tokens to text
+        for i in range(bsz):
+            token_ids = tokens[i, :].tolist()
+            try:
+                # Cut at EOS token if it exists
+                eos_idx = token_ids.index(self.eos_id)
+                token_ids = token_ids[:eos_idx]
+            except ValueError:
+                pass  # No EOS, use full sequence
+
+            generated_text = self.tokenizer.decode(token_ids)
+            generated_texts.append(generated_text)
+            all_token_ids.append(token_ids)
+
+        # Create and return BinarizedText objects
+        results = []
+        for i in range(bsz):
+            results.append(BinarizedText(
+                prompt = prompts[i],
+                text=generated_texts[i],
+                token_ids=all_token_ids[i],
+                P1=P1_values[i] if return_debug else None,
+                random_values=random_values_all[i] if return_debug else None,
+                watermarked=False
+            ))
+
+        return results
+        
+
+           
+    def sample_next(
+        self,
+        logits: torch.FloatTensor, # (bsz, vocab_size): logits for last token
+        ngram_tokens: torch.LongTensor, # (bsz, ngram): tokens to consider when seeding
+        temperature: float = 0.8, # temperature for sampling
+        top_p: float = 0.95, # top p for sampling
+        return_debug: bool = False  # Optional: Return P1 and random_values_all
+    ) -> tuple:
+        """ Vanilla sampling with temperature and top p.
+        
+        Sampling the next token using binary random selection with optional debug tracking.
+
+        Args:
+            logits: (bsz, vocab_size) - Logits for the last token in each batch item.
+            ngram_tokens: (bsz, ngram) - Context tokens used in seeding.
+            temperature: Controls randomness in sampling.
+            top_p: Nucleus sampling threshold.
+            return_debug: If True, returns P1 and random_values_all; otherwise, only returns tokens.
+
+        Returns:
+            If `return_debug=False`: Returns `next_tokens` (bsz,)
+            If `return_debug=True`: Returns tuple `(next_tokens, prob_bit_1, random_values_all)`
+        """
+        bsz, vocab_size = logits.shape  # Get batch size and vocab size
+        if temperature > 0:
+            probs = torch.softmax(logits / temperature, dim=-1)
+            probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+            probs_sum = torch.cumsum(probs_sort, dim=-1)
+            mask = probs_sum - probs_sort > top_p
+            probs_sort[mask] = 0.0
+            probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+            # Restore to original probability order
+            probs_original_order = torch.zeros_like(probs)
+            probs_original_order.scatter_(-1, probs_idx, probs_sort)
+            # Initialize token storage
+            next_tokens = torch.zeros((bsz,), dtype=torch.long, device=self.model.device)
+
+            # Initialize debugging lists (optional)
+            prob_bit_1_all = [[] for _ in range(bsz)] if return_debug else None
+            random_values_all = [[] for _ in range(bsz)] if return_debug else None
+
+            # Process each batch independently
+            for i in range(bsz):
+                token_id = 0  # Initialize token ID for this batch
+
+                for bit_index in range(self.blen):
+                    # Compute p0 and p1 for the current bit
+
+                    p0, p1 = self._binarize_next(probs_original_order[i], bit_index, self.blen, token_id)
+
+                    # Generate a random value
+                    rand_val = random.random()
+
+                    # Compute probability of bit being 1
+                    p0_val = p0.item()
+                    p1_val = p1.item()
+                    total = p0_val + p1_val
+                    prob_bit_1 = (p1_val / total) if total > 0 else 0
+
+                    # Shift token_id left to prepare for the new bit
+                    token_id <<= 1
+
+                    # Determine if the new bit is 1 or 0 based on randomness
+                    if rand_val < prob_bit_1:
+                        token_id += 1
+
+                    # Store debug values if requested
+                    if return_debug:
+                        prob_bit_1_all[i].append(prob_bit_1)
+                        random_values_all[i].append(rand_val)
+
+                # Assign computed token ID to the batch
+                next_tokens[i] = token_id
+
+        else:
+            # If temperature is 0, use deterministic argmax
+            next_tokens = torch.argmax(logits, dim=-1)
+        next_tokens = next_tokens.reshape(-1)
+        # Return only next_tokens by default
+        if return_debug:
+            return next_tokens, prob_bit_1_all, random_values_all
+        return next_tokens
+    
 
 ###############################################
 # GENERAL WATERMARK BASE
@@ -669,10 +831,54 @@ class Watermark:
     A general (abstract) base class for watermarking. 
     Does NOT rely on binarized logic.
     """
+    def __init__(self, 
+            ngram: int = 1,
+            seed: int = 0,
+            seeding: str = 'hash',
+            salt_key: int = 35317,
+            payload: int = 0
+        ):
+        
+        # watermark config
+        self.ngram = ngram
+        self.salt_key = salt_key
+        self.seed = seed
+        self.hashtable = torch.randperm(1000003)
+        self.seeding = seeding 
+        self.rng = torch.Generator()
+        self.rng.manual_seed(self.seed)
+        self.payload = payload
 
     def __init__(self):
         pass
 
+    def hashint(self, integer_tensor: torch.LongTensor) -> torch.LongTensor:
+        """Adapted from https://github.com/jwkirchenbauer/lm-watermarking"""
+        return self.hashtable[integer_tensor.cpu() % len(self.hashtable)] 
+    
+    def get_seed_rng(
+        self, 
+        input_ids: torch.LongTensor
+    ) -> int:
+        """
+        Seed RNG with hash of input_ids.
+        Adapted from https://github.com/jwkirchenbauer/lm-watermarking
+        """
+        if self.seeding == 'hash':
+            seed = self.seed
+            for i in input_ids:
+                seed = (seed * self.salt_key + i.item()) % (2 ** 64 - 1)
+        elif self.seeding == 'additive':
+            seed = self.salt_key * torch.sum(input_ids).item()
+            seed = self.hashint(seed)
+        elif self.seeding == 'skip':
+            seed = self.salt_key * input_ids[0].item()
+            seed = self.hashint(seed)
+        elif self.seeding == 'min':
+            seed = self.hashint(self.salt_key * input_ids)
+            seed = torch.min(seed).item()
+        return seed
+    
     def generate(self, *args, **kwargs):
         raise NotImplementedError("generate() must be implemented by subclasses.")
 
@@ -743,13 +949,17 @@ class ChristWatermark(BinarizedWatermark):
     def generate(
             self, 
             key, 
-            prompt, 
-            length=30, 
+            prompts: List[str],
+            max_gen_len: int = 30, 
+            length=30,
             Rlambda=5, 
-            flagR=False, 
-            flagPerm=False,
-            verbose=False
-        ):
+            temperature: float = 0.8,
+            top_p: float = 0.95,
+            return_debug: bool = False, 
+            flagR: bool=False, 
+            flagPerm: bool=False,
+            verbose: bool=False) -> List[BinarizedText]:
+            
             """
             Watermarked response generation using "Christ" method 
             (adapted from the original generate_watermarked_response_Christ function).
@@ -916,9 +1126,136 @@ class ChristWatermark(BinarizedWatermark):
                 empirical_entropies=empentropy,
                 avg_entropy=avg_entropy,
                 avg_emp_entropy=avg_emp_entropy,
-                n= n
+                n= n,
+                generatiom_key = key
             )
+    def sample_next(
+        self,
+        logits: torch.FloatTensor, # (bsz, vocab_size): logits for last token
+        ngram_tokens: torch.LongTensor, # (bsz, ngram): tokens to consider when seeding
+        temperature: float = 0.8, # temperature for sampling
+        top_p: float = 0.95, # top p for sampling
+        flagR: bool = False,
+        tkn_index: int = 0,
+        R = [],
+        H: float = 0,
+        Rlambda: float = 5,
+        key: any = None,
+        flagRchosen: bool = False,
+        return_debug: bool = False,  # Optional: Return P1 and random_values_all
+        verbose: bool = False
+    ) -> tuple:
+        """ Vanilla sampling with temperature and top p.
+        
+        Sampling the next token using binary random selection with optional debug tracking.
+
+        Args:
+            logits: (bsz, vocab_size) - Logits for the last token in each batch item.
+            ngram_tokens: (bsz, ngram) - Context tokens used in seeding.
+            temperature: Controls randomness in sampling.
+            top_p: Nucleus sampling threshold.
+            return_debug: If True, returns P1 and random_values_all; otherwise, only returns tokens.
+
+        Returns:
+            If `return_debug=False`: Returns `next_tokens` (bsz,)
+            If `return_debug=True`: Returns tuple `(next_tokens, P1, random_values_all)`
+        """
+        bsz, vocab_size = logits.shape  # Get batch size and vocab size
+        if temperature > 0:
+            probs = torch.softmax(logits / temperature, dim=-1)
+            probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+            probs_sum = torch.cumsum(probs_sort, dim=-1)
+            mask = probs_sum - probs_sort > top_p
+            probs_sort[mask] = 0.0
+            probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+            # Restore to original probability order
+            probs_original_order = torch.zeros_like(probs)
+            probs_original_order.scatter_(-1, probs_idx, probs_sort)
+            # Initialize token storage
+            next_tokens = torch.zeros((bsz,), dtype=torch.long, device=self.model.device)
+
+            # Initialize debugging lists (optional)
+            prob_bit_1_all = [[] for _ in range(bsz)] if return_debug else None
+            random_values_all = [[] for _ in range(bsz)] if return_debug else None
+            entropies = [0] * bsz  if return_debug else None,
+            empirical_entropies = [0] * bsz if return_debug else None
+            n = [0] * bsz if flagR else None
+
+            # Process each batch independently
+            for i in range(bsz):
+                token_id = 0  # Initialize token ID for this batch
+
+                for bit_index in range(self.blen):
+                    # Compute p0 and p1 for the current bit
+
+                    p0, p1 = self._binarize_next(probs_original_order[i], bit_index, self.blen, token_id)
+
+                    # Generate a random value
+                    rand_val = random.random()
+
+                    # Compute probability of bit being 1
+                    p0_val = p0.item()
+                    p1_val = p1.item()
+                    total = p0_val + p1_val
+                    prob_bit_1 = (p1_val / total) if total > 0 else 0
+
+                    # Shift token_id left to prepare for the new bit
+                    token_id <<= 1
+
+                    # Decide how to pick bit
+                    if (flagR and (not flagRchosen[i])):
+                        # We haven't yet triggered the pseudo-random phase
+                        rand_val = random.random()
+                        if rand_val < prob_bit_1:
+                            token_id += 1
+                            H[i] -=  math.log(prob_bit_1 + 1e-15)
+                        else:
+                            H[i] -=  math.log(1 - prob_bit_1 + 1e-15)
+                        R[i].append(token_id % 2)
+                        n[i] = len(R[i])
+
+                        # Check if we've reached threshold
+                        if H[i] >= Rlambda:
+                            flagRchosen[i] = True
+                            if verbose:
+                                print(f"Christ n= {n[i]}, R={R[i]} for batch {i}")
+                    elif (flagRchosen[i] and flagR):
+                        # Now we use the PRF-based approach
+                        rand_val = PRF(key, R[i] + [tkn_index, bit_index])
+                        if rand_val < prob_bit_1:
+                            token_id += 1
+                    else:
+                        # If flagR=False entirely, we just always do PRF
+                        rand_val = PRF(key, [tkn_index, bit_index])
+                        if rand_val < prob_bit_1:
+                            token_id += 1
+                    if rand_val < prob_bit_1:
+                        token_id += 1
+
+                    # Store debug values if requested
+                    if return_debug:
+                        prob_bit_1_all[i].append(prob_bit_1)
+                        random_values_all[i].append(rand_val)
+
+                # Assign computed token ID to the batch
+                next_tokens[i] = token_id
+
+                if return_debug:
+                    entropies[i] = entropyfnc(probs_original_order[i])
+                    # Calculate empirical "entropy" term
+                    # (negative log(probability of the chosen token))
+                    empirical_entropies[i] = -torch.log(probs_original_order[token_id] + 1e-15).item()
+
+        else:
+            # If temperature is 0, use deterministic argmax
+            next_tokens = torch.argmax(logits, dim=-1)
+        next_tokens = next_tokens.reshape(-1)
+        # Return only next_tokens by default
+        if return_debug:
+            return next_tokens, prob_bit_1_all, random_values_all
+        return next_tokens
     
+
     def decode(
         self, 
         key, 
@@ -1002,6 +1339,7 @@ class ChristWatermark(BinarizedWatermark):
                         text.best_score = scores[nstar]
                         text.best_normalized_score = normalized_score[nstar]
                         text.watermarked = True
+                        text.detection_key = key
                         if isinstance(text, BinarizedText):
                             return BinarizedWatermarkedText.from_binarized_text(
                                 text,
@@ -1018,12 +1356,13 @@ class ChristWatermark(BinarizedWatermark):
             text.best_score = scores[nstar]
             text.best_normalized_score = normalized_score[nstar]
             text.watermarked = False
+            text.detection_key = key
             if isinstance(text, BinarizedText):
                 return text
             else:
                 return BinarizedText.from_binarized_watermarked_text(text)            
             
-        else:
+        else: # flagR = False
             Y = []
             normalized_score = 0
             tkn_scores = []
@@ -1049,6 +1388,7 @@ class ChristWatermark(BinarizedWatermark):
                 text.best_score = scores[nstar]
                 text.best_normalized_score = normalized_score[nstar]
                 text.watermarked = True
+                text.detection_key = key
                 if isinstance(text, BinarizedText):
                     return BinarizedWatermarkedText.from_binarized_text(
                                 text,
@@ -1066,6 +1406,7 @@ class ChristWatermark(BinarizedWatermark):
                 text.best_score = scores[nstar]
                 text.best_normalized_score = normalized_score[nstar]
                 text.watermarked = False
+                text.detection_key = key
                 if isinstance(text, BinarizedText):
                     return text
                 else:
@@ -1161,10 +1502,9 @@ class ChristWatermarkMultiKey(ChristWatermark):
         self, 
         keys, 
         text, 
-        skip_prefix=1, 
         threshold=5, 
-        flagR=False, 
-        flagTokens=True
+        flagR=False,
+        flagPerm=False
     ):
         """
         Detects the presence of a Christ watermark in the given text when multiple keys are used.
@@ -1198,10 +1538,9 @@ class ChristWatermarkMultiKey(ChristWatermark):
         for key_idx, key in enumerate(keys):
             BinarizedWatermarkedText_dict[key_idx] = super.decode(key = key, 
                     text=text, 
-                    skip_prefix= skip_prefix, 
                     threshold=threshold, 
-                    flagR=flagR, 
-                    flagTokens=flagTokens)
+                    flagR=flagR,
+                    flagPerm=flagPerm)
             n = BinarizedWatermarkedText_dict[key_idx].n
             score = BinarizedWatermarkedText_dict[key_idx].normalized_score[n] if BinarizedWatermarkedText_dict[key_idx].watermarked else 0
             max_score = score if score > max_score else max_score
@@ -1251,7 +1590,7 @@ class DISC(BinarizedWatermark):
         """
         u = PRF(key, prf_input)
         bit = str(bit)
-        if prob_mode != 'random_embedding':
+        if prob_mode != 'random_embedding': # deterministic or R
             if bit == '1':
                 if u <= delta:
                     return -math.log(u - delta + 1)
@@ -1418,6 +1757,7 @@ class DISC(BinarizedWatermark):
         # Build initial context from last h tokens 
         # (decode bit pattern from each token)
         # --------------------------------------------------
+        watermarked_btkns = []
         context = []
         if prompt_len_tkn >= h:
             # Take last h tokens from the prompt
@@ -1496,6 +1836,7 @@ class DISC(BinarizedWatermark):
                                 print(f"DISC: n= {n}, R={R}")
 
                     else:
+                        watermarked_btkns.append(i * blen + bit_ind)
                         # PRF-based approach with deltaM shift
                         y = PRF(key, R + context)
                         # Insert your custom "if P1 + deltaM < 1" logic
@@ -1516,6 +1857,7 @@ class DISC(BinarizedWatermark):
                         else:
                             token_id += 0
                     else: # 1-1/h probability of embedding watermarked bit
+                        watermarked_btkns.append(i * blen + bit_ind)
                         y = (y - h) / (1 - h)
                         if P1 + deltaM < 1:
                             if deltaM < y < (P1 + deltaM):
@@ -1526,6 +1868,7 @@ class DISC(BinarizedWatermark):
                     Y.append(y)
                 elif prob_mode == None:
                     # If the watermarking is deterministic,
+                    watermarked_btkns.append(i * blen + bit_ind)
                     y = PRF(key, context)
                     if P1 + deltaM < 1:
                         if deltaM < y < (P1 + deltaM):
@@ -1579,6 +1922,7 @@ class DISC(BinarizedWatermark):
         mean_emp_entropy = np.average(empentropy, weights = current_probability)
 
         return BinarizedWatermarkedText(
+                prompt = prompt,
                 text=generated_text,
                 token_ids=new_token_ids.tolist(),
                 P1=P1vec,
@@ -1587,7 +1931,9 @@ class DISC(BinarizedWatermark):
                 empirical_entropies=empentropy,
                 avg_entropy=mean_entropy,
                 avg_emp_entropy=mean_emp_entropy,
-                n=n
+                n=n,
+                generation_key = key, 
+                watermarked_btkns=watermarked_btkns
         )
     
     def decode(
@@ -1595,13 +1941,11 @@ class DISC(BinarizedWatermark):
         key, 
         text, 
         nbits, 
-        skip_prefix=1, 
         FPR=1e-2, 
         h=4, 
         prob_mode=None, 
         context_mode = 'type2',
         verbose=True, 
-        flagTokens=True,
         flagPerm = False
     ):
         """
@@ -1611,9 +1955,8 @@ class DISC(BinarizedWatermark):
         ----------
         key : any
             Key used for the pseudo-random function.
-        text : str or list of token IDs
-            The watermarked text. If `flagTokens=False`, this is a string.
-            If `flagTokens=True`, this is already a list of token IDs.
+        text : BinarizedText or BinarizedWatermarkedText
+            The watermarked text object containing the tokenized text.
         nbits : int
             Number of bits in the payload message.
         skip_prefix : int, optional
@@ -1635,24 +1978,25 @@ class DISC(BinarizedWatermark):
         flagPerm : bool, optional
             If True, applies a permutation to the probability distribution.    
         verbose : bool, optional
-            If True, prints debug info.
-        flagTokens : bool, optional
-            If True, assumes `text` is already tokenized; otherwise, tokenizes it.
+            If True, prints debug info.        
 
         Returns
         -------
-        BinarizedWatermarkedText
-            A specialized watermarked text object.
+        BinarizedWatermarkedText or BinarizedText
+            Dependent on the detection outcome, the output is either a watermarked 
+            text object or a plain text object.
         """
         # Adjust `skip_prefix` dynamically for LLaMA vs. GPT-2
         # skip_prefix = 1 for llama 2 as a sentence is tokenized with <s> in this model
         # and skip_prefix = 0 for gpt2 as <s> token does not exist at the beginning of a text in this model
         # in Llama 2 when a watermarked text is generated, the watermarked text starts with a token with (unseeable)"-" at 
         # the beginning, for example, in a watermarked response "Here the three ...", the token for "Here" is actually "-Here" 
-        if not flagTokens:
-            if "llama" in self.tokenizer.name_or_path:
-                text = "-" + text.split(" ", 1)[0] + text.split(" ", 1)[1]
-                skip_prefix = 2  # Adjust for leading <s> token
+        # if not flagTokens:
+        #     if "llama" in self.tokenizer.name_or_path:
+        #         text = "-" + text.split(" ", 1)[0] + text.split(" ", 1)[1]
+        #         skip_prefix = 2  # Adjust for leading <s> token
+        if not isinstance(text, (BinarizedText, BinarizedWatermarkedText)):
+            raise TypeError("text must be an instance of BinarizedText or BinarizedWatermarkedText")
 
         # Total number of possible payloads
         nM = 2 ** nbits
@@ -1667,17 +2011,17 @@ class DISC(BinarizedWatermark):
 
         # Retrieve `blen` from the parent class
         blen = self.blen
-
-        # Tokenization if text is not already tokenized
-        if not flagTokens:
-            tokens = self._tokenize(text)[0][skip_prefix:]
-            if verbose:
-                print("Received watermarked text tokens:", tokens.tolist())
-        else:
-            tokens = text
-            if verbose:
-                print("Received watermarked text tokens:", tokens)
-
+        tokens = text.token_ids
+        # # Tokenization if text is not already tokenized
+        # if not flagTokens:
+        #     tokens = self._tokenize(text)[0][skip_prefix:]
+        #     if verbose:
+        #         print("Received watermarked text tokens:", tokens.tolist())
+        # else:
+        #     tokens = text
+        #     if verbose:
+        #         print("Received watermarked text tokens:", tokens)
+        
          
         if prob_mode == 'R': # Collect reference bits if R is being used
             # Initialize score matrices
@@ -1753,38 +2097,54 @@ class DISC(BinarizedWatermark):
 
             # Find best scoring payload
             nstar, Mstar, pstar = self.min_score(p)
-            nstar = nstar + blen * h + 1
+            nstar = nstar + blen * h # nstar is the index of the first binary token of the watermark
             if verbose:
                 print(f"Detected message: {('0' * nbits + bin(gray2int(Mstar))[2:])[-nbits:]}, nstar={nstar}, Mstar={Mstar}")
 
             # Validate the decodeed message based on the False Positive Rate (FPR)
             if 1 - (1 - nM * pstar) ** ((len(tokens) - h) * blen) < FPR:
-                return BinarizedWatermarkedText(
-                            text=text,
-                            watermarked=True,
-                            token_ids=tokens.tolist(),
-                            random_values=Y,
-                            n= nstar,
-                            scores=scores,
-                            tkn_scores=tkn_scores,
-                            p_value=p,
-                            embedded_message=gray2int(Mstar)
-                        )
-                if not deltailedData:
-                    return gray2int(Mstar)  # Return decodeed payload
+                text.random_values_at_decode = Y
+                text.score = scores
+                text.tkn_scores = tkn_scores
+                text.best_score = scores[nstar - h * blen]
+                text.watermarked = True
+                text.detection_key = key
+                text.p_value = p
+                text.best_p_value = pstar
+                text.decoded_message = gray2int(Mstar)
+                if isinstance(text, BinarizedText):
+                    return BinarizedWatermarkedText.from_binarized_text(
+                                text,
+                                n= nstar, 
+                                watermarked_btkns= list(range(nstar + 1, len(tokens) * blen))
+                            )
                 else:
-                    return gray2int(Mstar), nstar, Mstar, pstar, p, scores, indvScores, Y
+                    text.n = nstar
+                    text.watermarked_btkns= list(range(nstar + 1, len(tokens) * blen))
+                    return text
             else:
-                if not deltailedData:
-                    return False
+                text.random_values_at_decode = Y
+                text.score = scores
+                text.tkn_scores = tkn_scores
+                text.best_score = scores[nstar - h * blen]
+                text.watermarked = False
+                text.detection_key = key
+                text.p_value = p
+                text.best_p_value = pstar
+                if isinstance(text, BinarizedText):
+                    return text
                 else:
-                    return False, nstar, Mstar, pstar, p, scores, indvScores, Y
+                    return BinarizedText.from_binarized_watermarked_text(text) 
+                    
         elif prob_mode == 'random_embedding':
             # Initialize score matrices
             scores = [0] * nM 
-            indvScores = [[] for _ in range(nM)] 
+            tkn_scores = [[] for _ in range(nM)] 
             p = [0] * nM 
             Y = []
+            watermarked_btkns = []
+            contextSet = []
+            context = []
             for i in range(h * blen + 1, len(tokens) * blen): # a loop over the tokens to form context and the current token
             # i // blen represents the indx of the real token
             # i % blen represent the indx of the binary token in the current real token
@@ -1819,15 +2179,16 @@ class DISC(BinarizedWatermark):
                 y = PRF(key, context)
                 Y.append(y)
                 if y> 1/h: # 1/h probability of embedding non-watermarked bit
+                    watermarked_btkns.append(i)
                     if context + [int(token_bits[i % blen])] not in contextSet:
                         contextSet.append(context + [int(token_bits[i % blen])])    
 
                         for j in range(nM):  # Iterate over all delta_j values
                             deltaM = j / nM if nbits > 0 else 0
-                            indvScores[j].append(
+                            tkn_scores[j].append(
                                         self.score(key, context, token_bits[i % blen], deltaM, prob_mode, h)
                                     )
-                            scores[j] += indvScores[j][-1]  
+                            scores[j] += tkn_scores[j][-1]  
 
             for inddelta in range(nM):
                 p[inddelta] = special.gammaincc(len(contextSet), scores[inddelta])
@@ -1840,20 +2201,28 @@ class DISC(BinarizedWatermark):
 
             # Validate the decodeed message based on the False Positive Rate (FPR)
             if 1 - (1 - nM * pstar) ** ((len(tokens) - h) * blen) < FPR:
-                if not deltailedData:
-                    return gray2int(Mstar)  # Return decodeed payload
+                text.random_values_at_decode = Y
+                text.score = scores
+                text.tkn_scores = tkn_scores
+                text.best_score = scores
+                text.watermarked = True
+                text.detection_key = key
+                text.p_value = p
+                text.best_p_value = pstar
+                text.decoded_message = gray2int(Mstar)
+                if isinstance(text, BinarizedText):
+                    return BinarizedWatermarkedText.from_binarized_text(
+                                text,
+                                watermarked_btkns= watermarked_btkns
+                            )
                 else:
-                    return gray2int(Mstar), Mstar, pstar, p, scores, indvScores, Y
-            else:
-                if not deltailedData:
-                    return False
-                else:
-                    return False, Mstar, pstar, p, scores, indvScores, Y       
+                    text.watermarked_btkns = watermarked_btkns
+                    return text
         
         elif prob_mode == None:
             # Initialize score matrices
             scores = [0] * nM 
-            indvScores = [[] for _ in range(nM)] 
+            tkn_scores = [[] for _ in range(nM)] 
             p = [0] * nM 
             Y = []
             for i in range(h * blen + 1, len(tokens) * blen): # a loop over the tokens to form context and the current token
@@ -1898,7 +2267,7 @@ class DISC(BinarizedWatermark):
                         scores[j] += self.score(
                                     key, context, token_bits[i % blen], deltaM
                         )
-                        indvScores[j].append(
+                        tkn_scores[j].append(
                                     self.score(key, context, token_bits[i % blen], deltaM)
                                 )
 
@@ -1913,15 +2282,37 @@ class DISC(BinarizedWatermark):
 
             # Validate the decodeed message based on the False Positive Rate (FPR)
             if 1 - (1 - nM * pstar) ** ((len(tokens) - h) * blen) < FPR:
-                if not deltailedData:
-                    return gray2int(Mstar)  # Return decodeed payload
+                text.random_values_at_decode = Y
+                text.score = scores
+                text.tkn_scores = tkn_scores
+                text.best_score = scores
+                text.watermarked = True
+                text.detection_key = key
+                text.p_value = p
+                text.best_p_value = pstar
+                text.decoded_message = gray2int(Mstar)
+                if isinstance(text, BinarizedText):
+                    return BinarizedWatermarkedText.from_binarized_text(
+                                text,
+                                watermarked_btkns= watermarked_btkns
+                            )
                 else:
-                    return gray2int(Mstar), Mstar, pstar, p, scores, indvScores, Y
+                    text.watermarked_btkns= watermarked_btkns
+                    return text
             else:
-                if not deltailedData:
-                    return False
+                text.random_values_at_decode = Y
+                text.score = scores
+                text.tkn_scores = tkn_scores
+                text.best_score = scores
+                text.watermarked = False
+                text.detection_key = key
+                text.p_value = p
+                text.best_p_value = pstar
+                if isinstance(text, BinarizedText):
+                    return text
                 else:
-                    return False, Mstar, pstar, p, scores, indvScores, Y
+                    return BinarizedText.from_binarized_watermarked_text(text) 
+
             
 class OZWatermark(BinarizedWatermark):
     """
@@ -2011,7 +2402,7 @@ class OZWatermark(BinarizedWatermark):
         H = 0
         n = 0
         R = []
-
+        watermarked_btkns = []
         # Tokenize the prompt
         prompt_ids = self._tokenize(prompt).to(self.model.device)
         prompt_len_tkn = prompt_ids.shape[1]
@@ -2020,7 +2411,12 @@ class OZWatermark(BinarizedWatermark):
 
         # Setup permutation
         vocab_size = len(self.tokenizer)
-        perm, inv_perm = consistent_perm(key, vocab_size) # Not necessary, but makes the token indices spread uniformly.
+        if flagPerm:
+            perm, inv_perm = consistent_perm(key, vocab_size)
+        else:
+            perm = range(vocab_size).tolist()
+            inv_perm = range(vocab_size).tolist()
+        # Not necessary, but makes the token indices spread uniformly.
         # This is done for assigning binary numbers of length blen to the tokens, for 
         # example should 0000 mean the first token of the tokenizer? If we use this permutation
         # then 0000 might refer the 100th token of the tokenizer
@@ -2089,11 +2485,13 @@ class OZWatermark(BinarizedWatermark):
 
                 # PRF-based sampling phase
                 elif flagRchosen and flagR:
+                    watermarked_btkns.append(i * blen + ind)    
                     if PRF(key, R + [i, ind, symbol]) < P1: # this is y_j < Pj(1)
                         token_id += 1  # w^b_j = 1 
                 elif not flagR:
                     if PRF(key, [i, ind, symbol]) < P1: # this is y_j < Pj(1)
                         token_id += 1 # w^b_j = 1 
+                    watermarked_btkns.append(i * blen + ind)    
 
                 # Score tracking for ECC decoding
                 if (not bit_limit) or (ind < bit_limit):
@@ -2120,10 +2518,7 @@ class OZWatermark(BinarizedWatermark):
                             break
 
             # Map back from permuted ID to the real vocabulary ID
-            if flagPerm:
-                real_token_id = inv_perm[token_id]
-            else:
-                real_token_id = token_id  
+            real_token_id = inv_perm[token_id]
             token = torch.tensor([[real_token_id]], device=self.model.device)
             prompt_ids = torch.cat([prompt_ids, token], dim=-1)
 
@@ -2134,19 +2529,25 @@ class OZWatermark(BinarizedWatermark):
             if DynamicECC.decode(ecc.stream)[:len(payload)] == payload:
                 generated_text = self._detokenize(prompt_ids[0][prompt_len_tkn:])
                 return BinarizedWatermarkedText(
+                    prompt=prompt,
                     text=generated_text,
                     token_ids=prompt_ids[0][prompt_len_tkn:].tolist(),
                     embedded_message=payload,
-                    decoded_message=DynamicECC.decode(ecc.stream)
+                    decoded_message=DynamicECC.decode(ecc.stream),
+                    generation_key=key,
+                    watermarked_btkns=watermarked_btkns
                 )
 
         # If payload is not fully embedded, return the generated text anyway
         generated_text = self._detokenize(prompt_ids[0][prompt_len_tkn:])
         return BinarizedWatermarkedText(
+            prompt=prompt,  
             text=generated_text,
             token_ids=prompt_ids[0][prompt_len_tkn:].tolist(),
             embedded_message=payload,
-            decoded_message=DynamicECC.decode(ecc.stream)
+            decoded_message=DynamicECC.decode(ecc.stream),
+            generation_key=key, 
+            watermarked_btkns=watermarked_btkns
         )
     
     def decode(
@@ -2155,8 +2556,6 @@ class OZWatermark(BinarizedWatermark):
         text, 
         threshold=2, 
         bit_limit=None, 
-        skip_prefix=0, 
-        flagTokens=True,
         flagPerm=False,
         verbose=False
     ):
@@ -2167,9 +2566,8 @@ class OZWatermark(BinarizedWatermark):
         ----------
         key : any
             Key used for the pseudo-random function.
-        text : str or list of token IDs
-            The watermarked text. If `flagTokens=False`, this is a string.
-            If `flagTokens=True`, this is already a list of token IDs.
+        text :  BinarizedText or BinarizedWatermarkedText
+            The watermarked text object containing the tokenized text.
         threshold : float, optional
             Score threshold for determining symbols ('0', '1', or '<').
             The default is 2.
@@ -2179,9 +2577,6 @@ class OZWatermark(BinarizedWatermark):
         skip_prefix : int, optional
             Number of initial tokens to ignore when decodeing payload.
             The default is 0.
-        flagTokens : bool, optional
-            If True, `text` is already tokenized; if False, `text` needs tokenization.
-            The default is True.
 
         Returns
         -------
@@ -2200,12 +2595,7 @@ class OZWatermark(BinarizedWatermark):
 
         # Retrieve blen from parent class
         blen = self.blen
-
-        # Tokenization if text is not already in token ID format
-        if not flagTokens:
-            tokens = self._tokenize(text)[0][skip_prefix:]
-        else:
-            tokens = text  # Assuming already tokenized
+        tokens = text.token_ids
 
         # Process each token
         for i in range(len(tokens)):
@@ -2232,8 +2622,15 @@ class OZWatermark(BinarizedWatermark):
             print("decodeed stream:", stream)
 
         # Decode decodeed binary stream into the final payload message
-        decodeed_payload = DynamicECC.decode(stream)
-        return decodeed_payload
+        text.watermarked = True
+        text.detection_key = key
+        text.decoded_message = DynamicECC.decode(stream)
+        if isinstance(text, BinarizedText):
+            return BinarizedWatermarkedText.from_binarized_text(
+                    text)
+        else:
+            return text
+        
     
     
 

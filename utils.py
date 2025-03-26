@@ -69,10 +69,18 @@ def PRF(key, input):
 def entropyfnc(prob_list):
     """
     Compute the Shannon entropy of a probability distribution.
-    
+
+    Args:
+        prob_list (torch.Tensor or list): Probability distribution tensor.
+
+    Returns:
+        float: Shannon entropy value.
     """
-    # Safe way to compute -sum(p log p), ignoring p=0 cases
-    return -sum(p * math.log(p) for p in prob_list if p > 0)
+    if isinstance(prob_list, torch.Tensor):
+        prob_list = prob_list.to(dtype=torch.float32)  # Ensure float type for stability
+
+    # Safe computation of entropy: -sum(p * log(p)), ignoring zero probabilities
+    return -torch.sum(prob_list * torch.log(prob_list + 1e-10)).item()  # Avoid log(0) with epsilon
 
 
 def bool_inst(v):
