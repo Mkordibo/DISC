@@ -1,0 +1,9 @@
+torch
+transformers
+scipy
+cryptography
+tqdm
+accelerate
+sentencepiece
+python-dotenv
+msgpack
