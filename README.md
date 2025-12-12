@@ -1,6 +1,6 @@
 # Implementations of LLM Watermarking Algorithms
 
-This repository contains Python implementations of several recent watermarking algorithms for Large Language Models (LLMs). The goal is to provide clear, concise, and faithful replications of these schemes for research purposes.
+This repository contains Python implementations of several recent watermarking algorithms for Large Language Models (LLMs), including DISC. The goal is to provide clear, concise, and faithful replications of these schemes for research purposes.
 
 ***
 
@@ -20,7 +20,7 @@ This library includes implementations of the following watermarking schemes:
 
 * **DISC**: A payload-embedding scheme based on a circular-shifted version of arithmetic coding that uses Gray codes for robustness.
 
-> Kordi, Y., et al. (2025). *Multi-Bit Distortion-Free Watermarking for Large Language Models*. [arXiv:2402.16578](https://arxiv.org/abs/2402.16578).
+> Kordi, Y., et al. (2024). *Multi-Bit Distortion-Free Watermarking for Large Language Models*. [arXiv:2402.16578](https://arxiv.org/abs/2402.16578).
 
 ***
 
