@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+disc/__init__.py
+disc/cli.py
+disc/core.py
+disc/huggingface.py
+disc/simulation.py
+disc_watermark.egg-info/PKG-INFO
+disc_watermark.egg-info/SOURCES.txt
+disc_watermark.egg-info/dependency_links.txt
+disc_watermark.egg-info/entry_points.txt
+disc_watermark.egg-info/requires.txt
+disc_watermark.egg-info/top_level.txt
+tests/test_core.py

@@ -1,34 +1,163 @@
-# Implementations of LLM Watermarking Algorithms
+# DISC: Multi-Bit Distortion-Free Watermarking
 
-This repository contains Python implementations of several recent watermarking algorithms for Large Language Models (LLMs). The goal is to provide clear, concise, and faithful replications of these schemes for research purposes.
+This repository contains a tested reference implementation of **Distribution
+Interval Shift Coding (DISC)** from:
 
-***
+> M. Kordi Boroujeny, Y. Jiang, K. Zeng, and B. L. Mark, “Multi-Bit
+> Distortion-Free Watermarking for Large Language Models,” arXiv:2402.16578.
 
-## Algorithms Implemented
+The maintained implementation is the `disc/` package. The original research
+prototypes remain for provenance, but they are not the public API.
 
-This library includes implementations of the following watermarking schemes:
+## Implemented
 
-* **Christ**: A detection and payload-embedding watermark based on arithmetic coding.
-
-> Christ, M., Gunn, S., & Zamir, O. (2023). *Undetectable Watermarks for Language Models*. [arXiv:2306.09194](https://arxiv.org/abs/2306.09194).
-
-
-* **OZ**: A robust, payload-embedding watermark that uses a dynamic error-correcting code to ensure message delivery.
-
-> Zamir, O., et al. (2024). *Excuse me, sir? Your language model is leaking (information)*. [arXiv:2401.10360](https://arxiv.org/abs/2401.10360).
-
-
-* **DISC**: A payload-embedding scheme based on a circular-shifted version of arithmetic coding that uses Gray codes for robustness.
-
-> Kordi, Y., et al. (2025). *Multi-Bit Distortion-Free Watermarking for Large Language Models*. [arXiv:2402.16578](https://arxiv.org/abs/2402.16578).
-
-***
+- binary-language-model conversion (Equations 31–32);
+- shifted-interval encoder (Equations 20–22 and Algorithm 3);
+- empirical-entropy random initialization;
+- HMAC-SHA256 PRF over the random prefix and binary n-gram context;
+- score and Erlang-tail test (Equations 24–26 and Algorithm 4);
+- repeated `(context, current bit)` removal during detection;
+- optional Hugging Face causal-LM adapter;
+- Section 5 Bernoulli simulation and Figure 5 reproduction script;
+- deterministic unit tests.
 
 ## Installation
 
-To get started, clone the repository and install the required dependencies.
+Python 3.10 or later is required.
 
 ```bash
-git clone [https://github.com/SurenSK/watermarking.git](https://github.com/SurenSK/watermarking.git)
-cd watermarking
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+```
+
+For Hugging Face generation:
+
+```bash
+pip install -e '.[hf]'
+```
+
+## Model-independent simulation
+
+```bash
+disc-simulate --runs 100 --payload-bits 4 --real-tokens 20
+
+# Optional Gray-code payload mapping
+disc-simulate --runs 100 --payload-bits 4 --real-tokens 20 --message-mapping gray
+```
+
+The command prints JSON containing BER, message accuracy, and detection rate.
+
+## Encode and detect binary tokens
+
+```python
+from disc import DiscDetector, DiscEncoder
+
+encoder = DiscEncoder(
+    key="replace-with-a-secret-key",
+    payload=5,
+    payload_bits=3,
+    entropy_threshold=5.0,
+    context_width=16,
+    seed=7,
+    message_mapping="direct",  # use "gray" for the optional Gray-code extension
+)
+
+for p_one in [0.2, 0.7, 0.4, 0.8] * 100:
+    encoder.encode_bit(p_one)
+
+result = DiscDetector(
+    key="replace-with-a-secret-key",
+    payload_bits=3,
+    context_width=16,
+    fpr=0.01,
+    message_mapping="direct",  # must match the encoder
+).detect(encoder.bits)
+
+print(result.detected, result.payload, result.global_p_value)
+```
+
+The decoder normally searches all admissible random-prefix lengths. A known
+start can be supplied in controlled tests with
+`detect(bits, n_star_candidates=[encoder.n_star])`.
+
+## Hugging Face generation
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from disc import DiscDetector, DiscEncoder
+from disc.huggingface import detect_token_ids, generate
+
+name = "openai-community/gpt2"
+tokenizer = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name)
+
+encoder = DiscEncoder("secret", payload=3, payload_bits=2, seed=11)
+text, generated_ids = generate(model, tokenizer, "Explain channel capacity:", encoder)
+
+detector = DiscDetector("secret", payload_bits=2)
+result = detect_token_ids(generated_ids, len(tokenizer), detector)
+print(text)
+print(result)
+```
+
+## Reproduce Figure 5
+
+The paper used 10,000 trials per point; start smaller for a smoke test.
+
+```bash
+python experiments/reproduce_figure5.py \
+  --runs 10000 \
+  --payload-bits 1 2 3 4 \
+  --real-tokens 4 6 8 10 12 16 20 24 30 \
+  --output output/figure5.csv
+```
+
+Use `--plot output/figure5.png` after `pip install -e '.[experiments]'`.
+The paper’s simulation uses 17 binary tokens per real token. Results can differ
+slightly with the PRF, finite Monte Carlo runs, and random seed.
+
+## Tests
+
+```bash
+pytest -q
+```
+
+## Layout
+
+```text
+disc/                         maintained reference implementation
+experiments/                  reproducibility scripts
+tests/                        deterministic unit tests
+DISC.py, watermarking.py      legacy research prototypes
+getData*.py, perfTests/       legacy performance experiments
+REPOSITORY_AUDIT.md           audit and migration guidance
+```
+
+## Direct and Gray-code message mappings
+
+The maintained API supports both mappings:
+
+- `message_mapping="direct"` is the default and follows the supplied paper:
+  `delta_M = M / 2^m`.
+- `message_mapping="gray"` first computes `G = M xor (M >> 1)` and embeds
+  `delta_G = G / 2^m`. The decoder searches the shifted intervals and applies
+  the inverse Gray transform before returning the payload.
+
+The encoder and decoder must use the same mapping. Gray mapping is a permutation
+of the message space, so it does not change the number of hypotheses or the
+multiple-testing correction. It can, however, make adjacent interval indices
+differ by one message bit, which may reduce bit errors when the estimated shift
+lands in a neighboring interval.
+
+## Interpretation choices
+
+- Direct mapping remains the paper-faithful default; Gray coding is retained as
+  an explicit optional extension and is never applied silently.
+- The global p-value uses `1 - (1 - |M| p*)^(L-h)`, not the number of
+  implementation-level coarse/fine evaluations.
+- Natural logarithms are used in empirical entropy and scores.
+- PRF input serialization is explicit and domain separated. Python’s global
+  `random` state is not used as a PRF.
+
+This is research code, not a production key-management or provenance system.

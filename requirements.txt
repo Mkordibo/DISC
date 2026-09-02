@@ -1,9 +1,2 @@
-torch
-transformers
-scipy
-cryptography
-tqdm
-accelerate
-sentencepiece
-python-dotenv
-msgpack
+# Compatibility install. Prefer: pip install -e '.[hf]'
+-e .[hf]

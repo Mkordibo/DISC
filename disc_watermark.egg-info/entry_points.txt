@@ -1,0 +1,2 @@
+[console_scripts]
+disc-simulate = disc.cli:main
