@@ -56,7 +56,7 @@ def _unmap_payload(mapped_payload: int, mapping: MessageMapping) -> int:
         return mapped_payload
     if mapping == "gray":
         return gray_decode(mapped_payload)
-    raise ValueError("message_mapping must be 'direct' or 'gray'")
+    raise ValueError("message_mapping must be 'direct' or 'gray'")      
 
 
 def _validate_bits(bits: Sequence[int]) -> None:
