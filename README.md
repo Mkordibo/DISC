@@ -16,6 +16,10 @@ prototypes remain for provenance, but they are not the public API.
 - empirical-entropy random initialization;
 - HMAC-SHA256 PRF over the random prefix and binary n-gram context;
 - score and Erlang-tail test (Equations 24–26 and Algorithm 4);
+- optional PRF context modes (`prefix_bit_ngram`, `bit_ngram`, `token_ngram`,
+  `prefix_token_ngram`);
+- Context-Anchored Balanced Scheduler (CABS) for multi-position DISC;
+- Fisher combination of per-position q-values so the overall FPR stays at `fpr`;
 - repeated `(context, current bit)` removal during detection;
 - optional Hugging Face causal-LM adapter;
 - Section 5 Bernoulli simulation and Figure 5 reproduction script;
@@ -80,6 +84,46 @@ print(result.detected, result.payload, result.global_p_value)
 The decoder normally searches all admissible random-prefix lengths. A known
 start can be supplied in controlled tests with
 `detect(bits, n_star_candidates=[encoder.n_star])`.
+
+## CABS multi-position DISC
+
+CABS (from MirrorMark, used here only as a scheduler) splits a payload into
+`H` symbols. Each eligible token is assigned to a position and watermarked
+with DISC using that position's shift. Detection scores each position, union-
+corrects by `2**m`, then mixes the per-position q-values with Fisher's method
+so the overall false-positive rate is still the configured `fpr`. Mirror
+mapping is not implemented.
+
+```python
+from disc import CabsConfig, DiscDetector, DiscEncoder
+
+encoder = DiscEncoder(
+    "secret",
+    payload=27,          # integer; with H=2 and m=4 this is symbols [1, 11]
+    payload_bits=4,      # m bits per position
+    n_positions=2,       # H
+    context_mode="token_ngram",
+    context_width=5,     # h previous tokens seed the PRF and CABS
+    seed=7,
+)
+# ... encoder.encode_token(lm_probs) ...
+
+result = DiscDetector(
+    "secret",
+    payload_bits=4,
+    n_positions=2,
+    context_mode="token_ngram",
+    context_width=5,
+    fpr=0.01,
+).detect(encoder.bits, token_ids=encoder.tokens, bit_length=width)
+```
+
+PRF `context_mode` options:
+
+- `prefix_bit_ngram` — `y = F(R, last h bits)` (default DISC with random init)
+- `bit_ngram` — `y = F(last h bits)` (DISC without random initialization)
+- `token_ngram` — `y = F(last h token IDs, bit index)` (typical with CABS)
+- `prefix_token_ngram` — same as token n-gram plus a random token prefix `R`
 
 ## Hugging Face generation
 

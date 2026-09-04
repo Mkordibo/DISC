@@ -1,0 +1,6 @@
+{
+  "include": ["disc", "tests", "experiments"],
+  "pythonVersion": "3.10",
+  "venvPath": ".",
+  "venv": ".venv"
+}
