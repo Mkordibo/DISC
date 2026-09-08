@@ -125,6 +125,11 @@ PRF `context_mode` options:
 - `token_ngram` — `y = F(last h token IDs, bit index)` (typical with CABS)
 - `prefix_token_ngram` — same as token n-gram plus a random token prefix `R`
 
+Pass `use_prefix=False` on both `DiscEncoder` and `DiscDetector` to keep a
+`prefix_*` mode but hash `R = []` and skip the decoder's `n_star` search.
+The first `h` tokens/bits are still generated without a watermark so the
+n-gram exists. CLI: `disc-simulate --no-prefix`.
+
 ## Hugging Face generation
 
 ```python

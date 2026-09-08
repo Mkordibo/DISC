@@ -108,3 +108,11 @@ def test_bit_ngram_context_round_trip():
     ).detect(encoder.bits)
     assert result.detected
     assert result.payload == 2
+
+
+def test_token_context_is_h_times_bits_per_token():
+    encoder = DiscEncoder("key", 1, 1, context_width=2, entropy_threshold=0, seed=1)
+    probs = np.array([0.25, 0.25, 0.25, 0.25])  # |V|=4 → w=2
+    encoder.encode_token(probs)
+    assert encoder.bits_per_token == 2
+    assert encoder.binary_context_width == 4  # h * ceil(log2 |V|)

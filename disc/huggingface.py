@@ -129,7 +129,10 @@ def detect_token_ids(
     """
     width = math.ceil(math.log2(vocab_size))  # int bits/token, e.g. 16
     bits = token_ids_to_bits(token_ids, width)  # list[int] of 0/1, length = N * width
-    candidates = range(width, len(bits), width) if token_aligned_starts else None
+    if not detector.use_prefix:
+        candidates = [0]
+    else:
+        candidates = range(width, len(bits), width) if token_aligned_starts else None
     return detector.detect(
         bits,
         n_star_candidates=candidates,

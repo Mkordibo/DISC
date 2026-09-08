@@ -5,18 +5,77 @@ Kordi Boroujeny et al., "Multi-Bit Distortion-Free Watermarking for Large
 Language Models" (arXiv:2402.16578v1).
 
 All logarithms are natural logarithms, as in the paper. Positions in this
-module are zero based; ``n_star`` is the number of random-initialization bits.
+module are zero based. ``n_star`` is how many leading bits were generated
+from the LM with no watermark; those bits are the prefix ``R`` used later
+as a PRF input. The decoder searches candidate ``n_star`` values.
 
 Data the rest of the package works with
 ---------------------------------------
 - ``bits``: ``list[int]`` of 0/1 values, e.g. ``[1, 0, 1, 1, 0]``.
-- ``payload``: ``int`` in ``{0, ..., 2**payload_bits - 1}``, e.g. ``5`` with
-  ``payload_bits=3`` (eight possible messages).
-- ``delta_m``: ``float`` shift on the unit interval, ``payload / 2**m``.
-  Example: payload 5, m=3 → ``5 / 8 = 0.625``.
+- ``payload_bits`` (``m``): bits stored in one DISC position.
+  Example: ``m = 4`` means each position holds a symbol in ``{0, ..., 15}``.
+- ``n_positions`` (``H``): how many DISC positions the message is split into.
+  Each position is watermarked with DISC. ``H`` may be 1 or greater;
+  CABS is only the optional scheduler that assigns tokens to those positions.
+- ``payload``: the full integer message, ``m * H`` bits long.
+  Range: ``{0, ..., 2**(m * H) - 1}``.
+  Example: ``m = 4``, ``H = 2`` → 8-bit payload in ``{0, ..., 255}``.
+  ``payload = 27`` splits as symbols ``[1, 11]`` because ``27 = 1 * 16 + 11``.
+- ``delta_m``: the unit-interval shift used by DISC at one position,
+  ``symbol / 2**m``. It is computed from that position's symbol, not from
+  the full payload. In the example: ``1/16 = 0.0625`` and ``11/16 = 0.6875``.
+  If ``H = 1`` there is only one symbol, so ``delta_m = payload / 2**m``.
 - ``probability_one`` / ``p_one``: ``float`` in ``[0, 1]``, P(next bit = 1).
 - ``y``: ``float`` in ``[0, 1)``, HMAC-PRF output used as a uniform sample.
-- ``n_star``: ``int``, length of the random (unwatermarked) prefix.
+- ``n_star``: ``int``, length of the unwatermarked prefix ``R``.
+  Encoder: first ``n_star`` bits are sampled from the LM, then PRF uses ``R``.
+  Decoder: ``n_star`` is unknown, so each candidate start treats
+  ``bits[:n_star]`` as ``R``.
+  ``use_prefix=False`` (or ``context_mode`` ``bit_ngram`` / ``token_ngram``)
+  means no ``R``: ``n_star = 0``, ``R = []``, and the decoder does not search
+  starts. The first ``h`` tokens/bits are still generated without a watermark
+  so the n-gram exists; they are not hashed as ``R``.
+- ``context_width`` (``h``): context length in real tokens, as in the papers.
+  The binary n-gram is ``S_{i,h} = W^b_{[i - h w : i - 1]}`` with
+  ``w = ceil(log2 |V|)``, i.e. the last ``h * w`` bits.
+  For a pure bit stream (``|V| = 2``, Bernoulli tests) ``w = 1``, so ``h``
+  bits. CABS always uses the last ``h`` token IDs.
+
+Call flow
+---------
+Encode (DiscEncoder.encode_token / encode_bit)::
+
+    encode_token
+      └─ encode_bit                 once per bit of the real token
+           ├─ _sample_unwatermarked if use_prefix: first n_star bits are R
+           │                        if not: only h tokens/bits of n-gram warm-up
+           ├─ CabsScheduler.propose only if H>1 / CABS: which position this token uses
+           └─ prf_uniform           y = F(R, context); R=[] when use_prefix=False
+                ├─ HmacPrf.uniform          bit modes
+                │     _pack_bits + _digest_to_unit
+                └─ HmacPrf.uniform_tokens   token modes
+                      _pack_u32s + _digest_to_unit
+
+Detect (DiscDetector.detect)::
+
+    detect
+      ├─ if use_prefix: try candidate n_star; bits[:n_star] is hypothesized R
+      │  if not: n_star=0, R=[] (no start search)
+      ├─ _score / _score_indices / _detect_positions
+      │     same prf_uniform → uniform / uniform_tokens as encode
+      ├─ disc_score + Erlang tail
+      └─ combine_p_values           only if H>1
+
+Why the layers exist
+--------------------
+- DiscEncoder / DiscDetector: paper Algorithms 3 and 4 (public API).
+- prf_uniform: shared entry so encode and detect slice the same R and n-gram.
+- HmacPrf.uniform / uniform_tokens: the PRF F itself (HMAC → y in (0, 1)).
+- _pack_bits / _pack_u32s: HMAC needs bytes, not Python lists.
+- _digest_to_unit: 32-byte digest → y in (0, 1); shared by both PRF methods.
+- split_payload, disc_score, in_shifted_interval: math used on both sides.
+Leading-underscore helpers are not a second API; they only avoid duplicating
+packing and the digest-to-float map.
 """
 
 from __future__ import annotations
@@ -35,17 +94,45 @@ from scipy.special import gammaincc
 
 from .cabs import CabsConfig, CabsScheduler
 
-# "direct" embeds payload M as delta = M / 2^m (paper default).
-# "gray" first maps M to binary-reflected Gray code, then uses that index.
-# Example: payload 6 with m=3 → direct uses 6; gray uses gray_encode(6) = 5.
+# "direct" embeds one position's symbol M as delta = M / 2^m (paper default).
+# "gray" first maps that symbol to binary-reflected Gray code, then uses it.
+# Example: symbol 6 with m=3 → direct uses 6; gray uses gray_encode(6) = 5.
+# With H>1 this is applied separately to each position, not to the full payload.
 MessageMapping = Literal["direct", "gray"]
 
 # How the PRF is seeded for each binary token (DISC §3.2 vs §3.3, plus token n-grams).
-#   "prefix_bit_ngram"    — y = F(R, last h bits). Default DISC with random init.
-#   "bit_ngram"           — y = F(last h bits). DISC without random initialization.
-#   "token_ngram"         — y = F(last h token IDs, bit index). Natural with CABS.
-#   "prefix_token_ngram"  — y = F(random-init token prefix R, last h token IDs, bit index).
+# h is always in real tokens; bit modes expand it to h * ceil(log2|V|) bits.
+#
+# R is not a random number. In the encoder the first n_star bits/tokens are
+# sampled from the LM (or Bernoulli) with no watermark; that prefix is R.
+# After that, and in the decoder, y = F(R, context). The decoder does not
+# know n_star, so it tries several candidate lengths and treats the first
+# n_star bits of the observed binary stream as R.
+#   "prefix_bit_ngram"    — y = F(R, last h*w bits). Default DISC (uses R).
+#   "bit_ngram"           — y = F(last h*w bits). No R (DISC without prefix).
+#   "token_ngram"         — y = F(last h token IDs, bit index). No R.
+#   "prefix_token_ngram"  — y = F(R as token prefix, last h token IDs, bit index).
+# Set use_prefix=False on the encoder/detector to keep a prefix_* mode but
+# hash R=[] and skip the decoder's n_star search (same as the no-R modes).
 ContextMode = Literal["prefix_bit_ngram", "bit_ngram", "token_ngram", "prefix_token_ngram"]
+
+
+def _resolve_use_prefix(context_mode: ContextMode, use_prefix: bool | None) -> bool:
+    """True if encode/detect should collect and search a nonempty prefix ``R``.
+
+    ``None`` follows the context mode: prefix_* → True, otherwise False.
+    ``False`` forces ``R = []`` even for prefix_* modes.
+    """
+    if use_prefix is None:
+        return context_mode.startswith("prefix")
+    if use_prefix and not context_mode.startswith("prefix"):
+        raise ValueError("use_prefix=True requires prefix_bit_ngram or prefix_token_ngram")
+    return bool(use_prefix)
+
+
+# ---------------------------------------------------------------------------
+# Payload mapping and multi-position helpers (used by both encode and detect)
+# ---------------------------------------------------------------------------
 
 
 def gray_encode(value: int) -> int:
@@ -198,10 +285,15 @@ def combine_p_values(p_values: Sequence[float]) -> float:
     return float(gammaincc(len(values), score))
 
 
+# ---------------------------------------------------------------------------
+# PRF: prf_uniform chooses R and context; HmacPrf is F itself
+# ---------------------------------------------------------------------------
+
+
 def prf_uniform(
     prf: HmacPrf,
     context_mode: ContextMode,
-    *,
+    *,  # everything after this must be passed by name (bits=..., bit_index=..., ...)
     bits: Sequence[int],
     bit_index: int,
     context_width: int,
@@ -213,18 +305,39 @@ def prf_uniform(
 ) -> float:
     """Draw the DISC PRF sample ``y`` for one binary token.
 
+    Called by ``DiscEncoder.encode_bit`` and ``DiscDetector`` scoring. This
+    function only slices ``R`` and the n-gram; ``HmacPrf`` computes ``F``.
+
+    The ``*`` in the signature makes ``bits``, ``bit_index``, ``context_width``,
+    and the later parameters keyword-only. That avoids mixing up two integers
+    (bit index vs h) if someone calls this positionally.
+
+    ``R`` is not a random number. It is the unwatermarked prefix of length
+    ``n_star`` (bits) or ``n_star_tokens`` (tokens). The encoder samples those
+    first tokens from the LM with no watermark; after that this function
+    hashes ``R`` together with the n-gram. The decoder does not know
+    ``n_star``, so each candidate start passes ``bits[:n_star]`` (or
+    ``tokens[:n_star_tokens]``) as ``R``.
+
+    Prefix modes: ``y = F(R, context)``. Non-prefix modes: ``y = F(context)``.
+
     Args:
         prf: Shared ``HmacPrf``.
         context_mode: Which strings seed the PRF. See ``ContextMode``.
         bits: Full bit stream so far (encode) or the whole stream (detect).
-        bit_index: Index of the bit being generated/scored. Context is
-            ``bits[bit_index - h : bit_index]``.
-        context_width: ``h``.
-        n_star: Random-init bit length for prefix modes.
+        bit_index: Index of the bit being generated/scored.
+        context_width: Slice length already converted to this mode's units.
+            Bit modes: ``h * ceil(log2 |V|)`` bits (last that many bits).
+            Token modes: ``h`` tokens (last that many token IDs).
+        n_star: Length of the unwatermarked bit prefix ``R``. Used only for
+            ``prefix_bit_ngram``: ``R = bits[:n_star]``. ``0`` means ``R = []``.
+            Encoder: true prefix length after LM sampling. Decoder: a
+            hypothesized start.
         tokens: Token IDs, required for token n-gram modes.
         token_index: Index of the current real token (not yet including it).
         bit_in_token: Bit offset inside that token, ``0`` = MSB.
-        n_star_tokens: Random-init token length for ``prefix_token_ngram``.
+        n_star_tokens: Length of the unwatermarked token prefix. Used only
+            for ``prefix_token_ngram``: ``R = tokens[:n_star_tokens]``.
 
     Returns:
         ``float`` in ``(0, 1)``.
@@ -234,6 +347,8 @@ def prf_uniform(
         if start < 0:
             raise ValueError("bit_index is too small for context_width")
         context = bits[start:bit_index]
+        # Prefix mode: R is the leading unwatermarked bits, not a random seed.
+        # Decoder: n_star is a hypothesized start, so R = bits[:n_star].
         initial = bits[:n_star] if context_mode == "prefix_bit_ngram" else []
         return prf.uniform(initial, context)
     if tokens is None or token_index is None:
@@ -245,6 +360,8 @@ def prf_uniform(
     if context_mode == "token_ngram":
         return prf.uniform_tokens(history, extra)
     if context_mode == "prefix_token_ngram":
+        # R = tokens[:n_star_tokens]: LM-sampled prefix (encoder) or a
+        # hypothesized start (decoder). Concatenated with the last h IDs.
         return prf.uniform_tokens(list(tokens[:n_star_tokens]) + list(history), extra)
     raise ValueError("context_mode must be a ContextMode literal")
 
@@ -252,8 +369,12 @@ def prf_uniform(
 class HmacPrf:
     """HMAC-SHA256 PRF with an explicit, portable input encoding.
 
-    Maps a secret key plus two bit-strings (random prefix ``R`` and n-gram
-    context ``S``) to a uniform sample ``y`` in ``(0, 1)``.
+    This is the paper's ``F``. Encode and detect never call it directly;
+    they go through ``prf_uniform`` (or CABS, which uses ``uniform_tokens``
+    / ``integer_hash``).
+
+    Maps a secret key plus two bit-strings (the unwatermarked prefix ``R``
+    and n-gram context ``S``) to a uniform sample ``y`` in ``(0, 1)``.
 
     Args / attributes:
         key: Secret. Accepted types:
@@ -335,11 +456,18 @@ class HmacPrf:
     def uniform(self, initial_bits: Sequence[int], context_bits: Sequence[int]) -> float:
         """Return a deterministic Uniform(0, 1) sample ``y``.
 
+        Called from ``prf_uniform`` for bit modes. This is ``F(R, S)``;
+        packing and the digest map are ``_pack_bits`` and ``_digest_to_unit``.
+
         Args:
-            initial_bits: Random-initialization prefix ``R``, ``list[int]`` of
-                0/1. Example: first ``n_star`` encoded bits, ``[1, 0, ..., 1]``.
+            initial_bits: Unwatermarked prefix ``R``, ``list[int]`` of 0/1.
+                Encoder: ``bits[:n_star]`` after LM sampling. Decoder: the
+                hypothesized leading bits for that candidate ``n_star``.
+                Empty (``R = []``) when ``use_prefix=False`` or the mode
+                does not use ``R``. ``uniform([], S)`` is valid.
             context_bits: Binary n-gram ``S_{i,h}``, the previous
-                ``context_width`` bits. Example with h=4: ``[0, 1, 1, 0]``.
+                ``h * ceil(log2 |V|)`` bits. Example with h=1, |V|=16:
+                4 bits ``[0, 1, 1, 0]``.
 
         Returns:
             ``float`` in ``(0, 1)``. Same inputs always yield the same ``y``.
@@ -354,12 +482,17 @@ class HmacPrf:
     def _pack_u32s(values: Sequence[int]) -> bytes:
         """Serialize integers as ``uint32 length || uint32 values`` (big-endian).
 
+        Used by ``uniform_tokens`` and ``integer_hash``. HMAC cannot hash a
+        Python list, so token IDs become: 4-byte count, then 4 bytes per ID.
+        ``>I`` means big-endian unsigned 32-bit int.
+
         Args:
             values: Token IDs or other non-negative ints that fit in 32 bits.
                 Example: ``[11, 7, 3]``.
 
         Returns:
-            Bytes. Example: three IDs → 4-byte count ``3`` plus 12 bytes of IDs.
+            Bytes. Example: ``[11, 7, 3]`` → 4-byte count ``3`` plus 12 bytes
+            of IDs (``11``, ``7``, ``3``).
         """
         packed = bytearray(struct.pack(">I", len(values)))
         for value in values:
@@ -368,7 +501,12 @@ class HmacPrf:
 
     @staticmethod
     def _digest_to_unit(digest: bytes) -> float:
-        """Map an HMAC digest to a float in ``(0, 1)`` via the 64-bit midpoint."""
+        """Map an HMAC digest to a float in ``(0, 1)`` via the 64-bit midpoint.
+
+        Used by ``uniform`` and ``uniform_tokens``. HMAC-SHA256 returns 32
+        bytes; DISC needs ``y`` in ``(0, 1)``. First 8 bytes become integer
+        ``k``, then ``(k + 0.5) / 2**64``.
+        """
         integer = int.from_bytes(digest[:8], "big")
         return (integer + 0.5) / 2**64
 
@@ -414,6 +552,11 @@ class HmacPrf:
         tag = domain if domain is not None else self.domain_cabs_frame
         digest = hmac.new(self._key, tag + self._pack_u32s(tokens), hashlib.sha256).digest()
         return int.from_bytes(digest[:8], "big")
+
+
+# ---------------------------------------------------------------------------
+# Shared interval / binary-LM math (encode_bit and detect both use these)
+# ---------------------------------------------------------------------------
 
 
 def conditional_bit_probability(
@@ -569,6 +712,11 @@ def disc_score(bit: int, y: float, delta_m: float) -> float:
     return -math.log(max(distance, np.finfo(np.float64).tiny))
 
 
+# ---------------------------------------------------------------------------
+# Encoder (Algorithm 3)
+# ---------------------------------------------------------------------------
+
+
 class DiscEncoder:
     """Stateful DISC encoder with optional CABS multi-position scheduling.
 
@@ -586,12 +734,17 @@ class DiscEncoder:
         payload_bits: Bits per position ``m``. Example: ``3``.
         n_positions: ``H``. Default ``1`` (plain DISC).
         context_mode: ``ContextMode``. Default ``"prefix_bit_ngram"``.
-        context_width: n-gram length ``h``. Bits for bit modes, tokens for
-            token modes. Default ``16``.
+        use_prefix: If False, skip ``R``: ``n_star = 0`` and ``y = F([], S)``.
+            ``None`` (default) is True for prefix_* modes and False otherwise.
+        context_width: ``h`` in real tokens (papers). Binary context is
+            ``h * bits_per_token`` bits, with ``bits_per_token = ceil(log2 |V|)``.
+            Default ``16``. For encode_bit-only streams, ``bits_per_token=1``.
+        bits_per_token: ``ceil(log2 |V|)``. Default ``1`` (each bit is a token).
+            ``encode_token`` sets this from the vocabulary size.
         use_cabs: Enable CABS. Default ``True`` iff ``n_positions > 1``.
         cabs_config: Optional ``CabsConfig``. Paper defaults if omitted.
-        entropy_threshold: Random-init stop in nats. Ignored for modes
-            without a prefix. Default ``5.0``.
+        entropy_threshold: Prefix-stop in nats. Ignored when ``use_prefix``
+            is False. Default ``5.0``.
         seed: RNG seed for unwatermarked / random-init bits.
         message_mapping: ``"direct"`` or ``"gray"`` (applied per symbol).
     """
@@ -604,8 +757,10 @@ class DiscEncoder:
         *,
         n_positions: int = 1,
         context_mode: ContextMode = "prefix_bit_ngram",
+        use_prefix: bool | None = None,
         entropy_threshold: float = 5.0,
         context_width: int = 16,
+        bits_per_token: int = 1,
         seed: int | None = None,
         message_mapping: MessageMapping = "direct",
         use_cabs: bool | None = None,
@@ -616,8 +771,10 @@ class DiscEncoder:
         total_bits = payload_bits * n_positions
         if not 0 <= payload < 2**total_bits:
             raise ValueError("payload must be in [0, 2**(payload_bits * n_positions))")
-        if entropy_threshold < 0 or context_width < 1:
-            raise ValueError("entropy_threshold must be non-negative and context_width positive")
+        if entropy_threshold < 0 or context_width < 1 or bits_per_token < 1:
+            raise ValueError(
+                "entropy_threshold must be non-negative and context_width, bits_per_token positive"
+            )
         if context_mode not in (
             "prefix_bit_ngram",
             "bit_ngram",
@@ -630,6 +787,7 @@ class DiscEncoder:
         self.payload_bits = payload_bits
         self.n_positions = n_positions
         self.context_mode: ContextMode = context_mode
+        self.use_prefix = _resolve_use_prefix(context_mode, use_prefix)
         self.message_mapping: MessageMapping = message_mapping
         self.symbols = split_payload(payload, n_positions, payload_bits)
         self.mapped_symbols = [_map_payload(symbol, message_mapping) for symbol in self.symbols]
@@ -638,43 +796,66 @@ class DiscEncoder:
         self.mapped_payload = self.mapped_symbols[0]
         self.delta_m = self.position_deltas[0]
         self.entropy_threshold = entropy_threshold
-        self.context_width = context_width
+        self.context_width = context_width  # h, real tokens
+        self.bits_per_token = bits_per_token  # w = ceil(log2 |V|); 1 for bit streams
         self.rng = random.Random(seed)
         self.bits: list[int] = []
         self.tokens: list[int] = []
         self.token_positions: list[int | None] = []
         self.empirical_entropy = 0.0
-        self.n_star: int | None = None if context_mode.startswith("prefix") else 0
-        self.n_star_tokens: int | None = None if context_mode == "prefix_token_ngram" else 0
+        self.n_star: int | None = None if self.use_prefix else 0
+        self.n_star_tokens: int | None = (
+            None if self.use_prefix and context_mode == "prefix_token_ngram" else 0
+        )
         self._in_token = False
         self._token_width = 1
         self._active_delta = self.delta_m
         self.use_cabs = n_positions > 1 if use_cabs is None else use_cabs
         self.cabs: CabsScheduler | None = None
         if self.use_cabs:
-            cabs_h = context_width if context_mode in ("token_ngram", "prefix_token_ngram") else 1
-            self.cabs = CabsScheduler(self.prf, n_positions, cabs_h, cabs_config)
+            # CABS Elig / tie-break always see h real tokens, not 1 bit.
+            self.cabs = CabsScheduler(self.prf, n_positions, context_width, cabs_config)
 
     @property
     def random_initialization(self) -> list[int]:
-        """Return the random prefix ``R`` as ``list[int]`` of 0/1.
+        """Return the unwatermarked prefix ``R`` as ``list[int]`` of 0/1.
 
-        If encoding is still initializing, this is all bits so far.
-        Example after finish: ``encoder.bits[:encoder.n_star]``, e.g. 18 bits.
+        This is ``bits[:n_star]`` once the encoder has finished the LM-sampled
+        prefix. If that prefix is still being generated, this is all bits so far.
         """
         end = len(self.bits) if self.n_star is None else self.n_star
         return self.bits[:end]
 
+    @property
+    def binary_context_width(self) -> int:
+        """Binary n-gram length: ``h * ceil(log2 |V|)`` bits."""
+        return self.context_width * self.bits_per_token
+
+    def _prf_context_len(self) -> int:
+        """Units expected by ``prf_uniform`` for the current context_mode."""
+        if self.context_mode in ("token_ngram", "prefix_token_ngram"):
+            return self.context_width
+        return self.binary_context_width
+
     def _needs_random_init(self) -> bool:
+        if not self.use_prefix:
+            return False
         if self.context_mode == "prefix_bit_ngram":
             return self.n_star is None and (
-                self.empirical_entropy < self.entropy_threshold or len(self.bits) < self.context_width
+                self.empirical_entropy < self.entropy_threshold
+                or len(self.bits) < self.binary_context_width
             )
         if self.context_mode == "prefix_token_ngram":
             return self.n_star_tokens is None and (
                 self.empirical_entropy < self.entropy_threshold or len(self.tokens) < self.context_width
             )
         return False
+
+    def _needs_context_warmup(self) -> bool:
+        """True until the n-gram window exists. Applies with or without ``R``."""
+        if self.context_mode in ("token_ngram", "prefix_token_ngram"):
+            return len(self.tokens) < self.context_width
+        return len(self.bits) < self.binary_context_width
 
     def _sample_unwatermarked(self, probability_one: float) -> int:
         bit = int(self.rng.random() < probability_one)
@@ -686,9 +867,10 @@ class DiscEncoder:
     def encode_bit(self, probability_one: float, *, watermark: bool = True, delta_m: float | None = None) -> int:
         """Sample the next binary token given P(bit = 1).
 
-        During random init, or when ``watermark=False``, samples Bernoulli.
-        Otherwise uses the shifted-interval encoder (Algorithm 3) with
-        ``delta_m`` (default: the active position's shift).
+        During the unwatermarked prefix, or when ``watermark=False``, samples
+        Bernoulli. Once ``R`` is finished, draws ``y`` via ``prf_uniform`` and
+        uses the shifted-interval encoder (Algorithm 3) with ``delta_m``
+        (default: the active position's shift). See the module call flow.
 
         Args:
             probability_one: ``float`` in ``[0, 1]``. Example: ``0.7``.
@@ -708,15 +890,9 @@ class DiscEncoder:
             elif delta_m is None:
                 delta_m = self.position_deltas[cabs_position]
 
-        unwatermarked = self._needs_random_init() or not watermark
-        if not unwatermarked and self.context_mode == "prefix_bit_ngram" and self.n_star is None:
+        unwatermarked = self._needs_random_init() or self._needs_context_warmup() or not watermark
+        if not unwatermarked and self.use_prefix and self.context_mode == "prefix_bit_ngram" and self.n_star is None:
             self.n_star = len(self.bits)
-        if (
-            not unwatermarked
-            and self.context_mode in ("bit_ngram", "token_ngram")
-            and len(self.bits) < self.context_width
-        ):
-            unwatermarked = True
 
         if unwatermarked:
             bit = self._sample_unwatermarked(probability_one)
@@ -724,7 +900,7 @@ class DiscEncoder:
                 self.context_mode == "prefix_bit_ngram"
                 and self.n_star is None
                 and self.empirical_entropy >= self.entropy_threshold
-                and len(self.bits) >= self.context_width
+                and len(self.bits) >= self.binary_context_width
             ):
                 self.n_star = len(self.bits)
         else:
@@ -736,7 +912,7 @@ class DiscEncoder:
                 self.context_mode,
                 bits=self.bits,
                 bit_index=len(self.bits),
-                context_width=self.context_width,
+                context_width=self._prf_context_len(),
                 n_star=0 if self.n_star is None else self.n_star,
                 tokens=self.tokens,
                 token_index=token_index,
@@ -768,6 +944,11 @@ class DiscEncoder:
         """
         probs = np.asarray(probabilities, dtype=np.float64)
         width = math.ceil(math.log2(probs.size))
+        if self.bits_per_token not in (1, width):
+            raise ValueError(
+                f"bits_per_token is {self.bits_per_token} but this vocab needs {width} bits"
+            )
+        self.bits_per_token = width
         self._token_width = width
         position: int | None = 0
         watermark = True
@@ -777,7 +958,7 @@ class DiscEncoder:
             watermark = position is not None
             if position is not None:
                 delta = self.position_deltas[position]
-        elif self._needs_random_init():
+        elif self._needs_random_init() or self._needs_context_warmup():
             watermark = False
 
         self._in_token = True
@@ -797,7 +978,8 @@ class DiscEncoder:
         if self.cabs is not None:
             self.cabs.commit(prefix)
         if (
-            self.context_mode == "prefix_token_ngram"
+            self.use_prefix
+            and self.context_mode == "prefix_token_ngram"
             and self.n_star_tokens is None
             and self.empirical_entropy >= self.entropy_threshold
             and len(self.tokens) >= self.context_width
@@ -843,6 +1025,11 @@ class DetectionResult:
     position_p_values: tuple[float, ...] = ()
 
 
+# ---------------------------------------------------------------------------
+# Detector (Algorithm 4)
+# ---------------------------------------------------------------------------
+
+
 class DiscDetector:
     """DISC detector (Algorithm 4) with optional CABS multi-position mixing.
 
@@ -859,7 +1046,11 @@ class DiscDetector:
         payload_bits: Bits per position ``m``.
         n_positions: ``H``. Default ``1``.
         context_mode: Must match the encoder.
-        context_width: ``h``.
+        use_prefix: Must match the encoder. False → ``R = []``, no ``n_star``
+            search. ``None`` follows the context mode.
+        context_width: ``h`` in real tokens. Binary n-gram is ``h * bits_per_token``.
+        bits_per_token: ``ceil(log2 |V|)``. Default ``1``. Detection with
+            ``token_ids`` uses ``bit_length`` when given.
         fpr: Overall false-positive target. Default ``0.01``.
         use_cabs: Default ``True`` iff ``n_positions > 1``.
         cabs_config: Optional ``CabsConfig``.
@@ -872,15 +1063,19 @@ class DiscDetector:
         *,
         n_positions: int = 1,
         context_mode: ContextMode = "prefix_bit_ngram",
+        use_prefix: bool | None = None,
         context_width: int = 16,
+        bits_per_token: int = 1,
         fpr: float = 0.01,
         deduplicate_ngrams: bool = True,
         message_mapping: MessageMapping = "direct",
         use_cabs: bool | None = None,
         cabs_config: CabsConfig | None = None,
     ):
-        if payload_bits < 1 or context_width < 1 or n_positions < 1:
-            raise ValueError("payload_bits, context_width, and n_positions must be positive")
+        if payload_bits < 1 or context_width < 1 or n_positions < 1 or bits_per_token < 1:
+            raise ValueError(
+                "payload_bits, context_width, n_positions, and bits_per_token must be positive"
+            )
         if not 0 < fpr < 1:
             raise ValueError("fpr must lie strictly between 0 and 1")
         if context_mode not in (
@@ -894,15 +1089,25 @@ class DiscDetector:
         self.payload_bits = payload_bits
         self.n_positions = n_positions
         self.context_mode: ContextMode = context_mode
+        self.use_prefix = _resolve_use_prefix(context_mode, use_prefix)
         self.message_count = 2**payload_bits
         self.context_width = context_width
+        self.bits_per_token = bits_per_token
         self.fpr = fpr
         self.deduplicate_ngrams = deduplicate_ngrams
         _map_payload(0, message_mapping)
         self.message_mapping: MessageMapping = message_mapping
         self.use_cabs = n_positions > 1 if use_cabs is None else use_cabs
         self.cabs_config = cabs_config
-        self._cabs_h = context_width if context_mode in ("token_ngram", "prefix_token_ngram") else 1
+        self._cabs_h = context_width
+
+    def _binary_h(self, bits_per_token: int | None = None) -> int:
+        return self.context_width * (bits_per_token or self.bits_per_token)
+
+    def _prf_context_len(self, bits_per_token: int | None = None) -> int:
+        if self.context_mode in ("token_ngram", "prefix_token_ngram"):
+            return self.context_width
+        return self._binary_h(bits_per_token)
 
     def _score(self, bits: Sequence[int], n_star: int, payload: int) -> tuple[float, int]:
         """Sum Equation (24) scores for one hypothesized (n_star, payload).
@@ -921,9 +1126,12 @@ class DiscDetector:
         score = 0.0
         count = 0
         seen: set[tuple[int, ...]] = set()
-        start = n_star if self.context_mode == "prefix_bit_ngram" else max(n_star, self.context_width)
+        bit_h = self._binary_h()
+        # Watermarked bits start after R, but the n-gram still needs h*w bits.
+        # n_star=0 (no R) therefore scores from bit_h, not from index 0.
+        start = max(n_star, bit_h)
         for index in range(start, len(bits)):
-            context = bits[index - self.context_width : index]
+            context = bits[index - bit_h : index]
             ngram = tuple(context) + (bits[index],)
             if self.deduplicate_ngrams and ngram in seen:
                 continue
@@ -933,7 +1141,7 @@ class DiscDetector:
                 self.context_mode,
                 bits=bits,
                 bit_index=index,
-                context_width=self.context_width,
+                context_width=self._prf_context_len(),
                 n_star=n_star if self.context_mode == "prefix_bit_ngram" else 0,
             )
             score += disc_score(bits[index], y, delta_m)
@@ -956,8 +1164,10 @@ class DiscDetector:
         score = 0.0
         count = 0
         seen: set[tuple[int, ...]] = set()
+        bit_h = self._binary_h(bit_length)
+        prf_h = self._prf_context_len(bit_length)
         for bit_index in bit_indices:
-            if bit_index < self.context_width and self.context_mode in (
+            if bit_index < bit_h and self.context_mode in (
                 "prefix_bit_ngram",
                 "bit_ngram",
             ):
@@ -971,7 +1181,7 @@ class DiscDetector:
                     bits[bit_index],
                 )
             else:
-                ngram = tuple(bits[bit_index - self.context_width : bit_index]) + (bits[bit_index],)
+                ngram = tuple(bits[bit_index - bit_h : bit_index]) + (bits[bit_index],)
             if self.deduplicate_ngrams and ngram in seen:
                 continue
             seen.add(ngram)
@@ -980,7 +1190,7 @@ class DiscDetector:
                 self.context_mode,
                 bits=bits,
                 bit_index=bit_index,
-                context_width=self.context_width,
+                context_width=prf_h,
                 n_star=n_star,
                 tokens=tokens,
                 token_index=token_index,
@@ -1078,6 +1288,11 @@ class DiscDetector:
     ) -> DetectionResult:
         """Search payloads and prefix lengths; return the corrected test.
 
+        For prefix modes with ``use_prefix=True``, each candidate ``n_star``
+        treats ``bits[:n_star]`` as ``R``. With ``use_prefix=False``, only
+        ``n_star=0`` (``R = []``) is tested. Scoring calls the same
+        ``prf_uniform`` as encode. See the module call flow.
+
         Args:
             bits: Observed binary stream.
             n_star_candidates: Optional prefix lengths for prefix modes.
@@ -1090,6 +1305,7 @@ class DiscDetector:
         """
         bits = list(bits)
         _validate_bits(bits)
+        bit_h = self._binary_h(bit_length)
         if self.use_cabs or self.n_positions > 1 or self.context_mode in (
             "token_ngram",
             "prefix_token_ngram",
@@ -1102,23 +1318,23 @@ class DiscDetector:
                 bit_length = bit_length or (len(bits) // max(len(token_ids), 1))
             n_star = 0
             n_star_tokens = 0
-            if n_star_candidates is not None:
+            if self.use_prefix and n_star_candidates is not None:
                 candidates = [c for c in n_star_candidates if c is not None]
                 n_star = candidates[0] if candidates else 0
             return self._detect_positions(bits, token_ids, bit_length, n_star, n_star_tokens)
 
-        if len(bits) <= self.context_width:
+        if len(bits) <= bit_h:
             return DetectionResult(False, None, None, 1.0, 1.0, 0.0, 0)
-        if self.context_mode == "bit_ngram":
-            n_star_candidates = [self.context_width] if n_star_candidates is None else n_star_candidates
+        if not self.use_prefix:
+            n_star_candidates = [0] if n_star_candidates is None else n_star_candidates
         candidates = (
             list(n_star_candidates)
             if n_star_candidates is not None
-            else range(self.context_width, len(bits))
+            else range(bit_h, len(bits))
         )
         best: tuple[float, float, int, int | None, int | None] = (1.0, 0.0, 0, None, None)
         for n_star in candidates:
-            if not self.context_width <= n_star < len(bits):
+            if n_star < 0 or n_star >= len(bits) or max(n_star, bit_h) >= len(bits):
                 continue
             for payload in range(self.message_count):
                 score, count = self._score(bits, n_star, payload)
@@ -1128,9 +1344,7 @@ class DiscDetector:
 
         local_p, score, count, n_star, mapped_payload = best
         per_start = min(1.0, self.message_count * local_p)
-        n_start_tests = (
-            1 if self.context_mode == "bit_ngram" else (len(bits) - self.context_width)
-        )
+        n_start_tests = 1 if not self.use_prefix else (len(bits) - bit_h)
         global_p = (
             -math.expm1(n_start_tests * math.log1p(-per_start))
             if per_start < 1.0

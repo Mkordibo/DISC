@@ -39,11 +39,12 @@ def main() -> None:
         --payload-bits        int,   default 4       (m; 16 messages)
         --real-tokens         int,   default 20      (n in the paper)
         --bits-per-token      int,   default 17      (binary tokens per real token)
-        --context-width       int,   default 16      (h, n-gram length)
+        --context-width       int,   default 16      (h real tokens; here |V|=2 so h bits)
         --entropy-threshold   float, default 5.0     (nats)
         --fpr                 float, default 0.01    (false-positive target)
         --seed                int,   default 0
         --message-mapping     str,   "direct" | "gray"
+        --no-prefix           flag           encode/detect with R=[]
 
     Returns:
         None. Side effect: writes a JSON object to stdout.
@@ -58,6 +59,11 @@ def main() -> None:
     parser.add_argument("--fpr", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--message-mapping", choices=["direct", "gray"], default="direct")
+    parser.add_argument(
+        "--no-prefix",
+        action="store_true",
+        help="watermark and detect with R=[] (no n_star search)",
+    )
     args = parser.parse_args()
     summary = run_simulation(
         runs=args.runs,
@@ -68,6 +74,7 @@ def main() -> None:
         fpr=args.fpr,
         seed=args.seed,
         message_mapping=args.message_mapping,
+        use_prefix=not args.no_prefix,
     )
     # asdict(summary) → dict[str, int | float]; indent=2 pretty-prints JSON.
     print(json.dumps(asdict(summary), indent=2))

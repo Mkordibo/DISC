@@ -106,6 +106,38 @@ def test_gray_mapping_round_trip():
     assert result.n_star == encoder.n_star
 
 
+def test_empty_r_is_valid_prf_input():
+    prf = HmacPrf("key")
+    empty = prf.uniform([], [0, 1, 1, 0])
+    nonempty = prf.uniform([1, 0], [0, 1, 1, 0])
+    assert 0.0 < empty < 1.0
+    assert empty == prf.uniform([], [0, 1, 1, 0])
+    assert empty != nonempty
+
+
+def test_use_prefix_false_round_trip():
+    key = "no-prefix"
+    encoder = DiscEncoder(
+        key,
+        5,
+        3,
+        context_width=8,
+        seed=7,
+        use_prefix=False,
+    )
+    rng = np.random.default_rng(12)
+    for p_one in rng.uniform(0.1, 0.9, 400):
+        encoder.encode_bit(float(p_one))
+    assert encoder.n_star == 0
+    assert encoder.random_initialization == []
+    result = DiscDetector(key, 3, context_width=8, fpr=0.01, use_prefix=False).detect(
+        encoder.bits
+    )
+    assert result.detected
+    assert result.payload == 5
+    assert result.n_star == 0
+
+
 def test_wrong_key_does_not_recover_known_payload():
     encoder = DiscEncoder("right", 3, 2, entropy_threshold=2.0, context_width=8, seed=8)
     for p_one in np.random.default_rng(2).uniform(0.1, 0.9, 250):
