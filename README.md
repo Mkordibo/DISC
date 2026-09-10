@@ -46,11 +46,15 @@ pip install -e '.[hf]'
 ```bash
 disc-simulate --runs 100 --payload-bits 4 --real-tokens 20
 
+# Choose how DISC seeds its PRF context.
+disc-simulate --context-mode prefix_token_ngram
+
 # Optional Gray-code payload mapping
 disc-simulate --runs 100 --payload-bits 4 --real-tokens 20 --message-mapping gray
 ```
 
-The command prints JSON containing BER, message accuracy, and detection rate.
+The command prints JSON containing BER, message accuracy, detection rate, and
+cumulative `generation_seconds` and `decoding_seconds` across all runs.
 
 ## Encode and detect binary tokens
 
@@ -62,7 +66,7 @@ encoder = DiscEncoder(
     payload=5,
     payload_bits=3,
     entropy_threshold=5.0,
-    context_width=16,
+    context_width=4,
     seed=7,
     message_mapping="direct",  # use "gray" for the optional Gray-code extension
 )
@@ -73,7 +77,7 @@ for p_one in [0.2, 0.7, 0.4, 0.8] * 100:
 result = DiscDetector(
     key="replace-with-a-secret-key",
     payload_bits=3,
-    context_width=16,
+    context_width=4,
     fpr=0.01,
     message_mapping="direct",  # must match the encoder
 ).detect(encoder.bits)
@@ -103,7 +107,7 @@ encoder = DiscEncoder(
     payload_bits=4,      # m bits per position
     n_positions=2,       # H
     context_mode="token_ngram",
-    context_width=5,     # h previous tokens seed the PRF and CABS
+    context_width=4,     # shared h previous tokens seed the PRF and CABS
     seed=7,
 )
 # ... encoder.encode_token(lm_probs) ...
@@ -113,7 +117,7 @@ result = DiscDetector(
     payload_bits=4,
     n_positions=2,
     context_mode="token_ngram",
-    context_width=5,
+    context_width=4,
     fpr=0.01,
 ).detect(encoder.bits, token_ids=encoder.tokens, bit_length=width)
 ```

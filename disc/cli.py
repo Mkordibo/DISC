@@ -39,7 +39,8 @@ def main() -> None:
         --payload-bits        int,   default 4       (m; 16 messages)
         --real-tokens         int,   default 20      (n in the paper)
         --bits-per-token      int,   default 17      (binary tokens per real token)
-        --context-width       int,   default 16      (h real tokens; here |V|=2 so h bits)
+        --context-width       int,   default 4       (h real tokens; here |V|=2 so h bits)
+        --context-mode        str,   default prefix_bit_ngram
         --entropy-threshold   float, default 5.0     (nats)
         --fpr                 float, default 0.01    (false-positive target)
         --seed                int,   default 0
@@ -54,7 +55,13 @@ def main() -> None:
     parser.add_argument("--payload-bits", type=int, default=4)
     parser.add_argument("--real-tokens", type=int, default=20)
     parser.add_argument("--bits-per-token", type=int, default=17)
-    parser.add_argument("--context-width", type=int, default=16)
+    parser.add_argument("--context-width", type=int, default=4)
+    parser.add_argument(
+        "--context-mode",
+        choices=["prefix_bit_ngram", "bit_ngram", "token_ngram", "prefix_token_ngram"],
+        default="prefix_bit_ngram",
+        help="PRF context representation used by the encoder and decoder",
+    )
     parser.add_argument("--entropy-threshold", type=float, default=5.0)
     parser.add_argument("--fpr", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=0)
@@ -74,7 +81,8 @@ def main() -> None:
         fpr=args.fpr,
         seed=args.seed,
         message_mapping=args.message_mapping,
-        use_prefix=not args.no_prefix,
+        use_prefix=False if args.no_prefix else None,
+        context_mode=args.context_mode,
     )
     # asdict(summary) → dict[str, int | float]; indent=2 pretty-prints JSON.
     print(json.dumps(asdict(summary), indent=2))

@@ -49,6 +49,31 @@ def test_cabs_skips_repeated_context():
     assert positions[6] is None  # same h-gram seen again
 
 
+def test_cabs_raw_bits_starts_binary_scheduling_after_prefix():
+    config = CabsConfig(window_size=3, frame_bits=2, max_factor=2.0, min_len=2)
+    encoder = DiscEncoder(
+        "partial-prefix",
+        payload=1,
+        payload_bits=1,
+        n_positions=2,
+        context_mode="prefix_bit_ngram",
+        context_width=2,
+        bits_per_token=4,
+        entropy_threshold=6.1,
+        seed=1,
+        use_cabs=True,
+        cabs_config=config,
+    )
+    for _ in range(20):
+        encoder.encode_bit(0.5)
+
+    # Binary CABS treats each bit as a scheduling token. All nine prefix bits
+    # are ordinary samples; eligible binary-token scheduling starts afterward.
+    assert encoder.n_star == 9
+    assert not any(encoder.watermark_mask[: encoder.n_star])
+    assert any(encoder.watermark_mask[encoder.n_star :])
+
+
 def test_cabs_disc_token_round_trip():
     key = "cabs-disc"
     payload_bits = 2
@@ -87,6 +112,48 @@ def test_cabs_disc_token_round_trip():
     assert result.detected
     assert result.payload == payload
     assert result.symbols == (2, 3)
+
+
+def test_cabs_token_prefix_round_trip():
+    key = "cabs-token-prefix"
+    config = CabsConfig(window_size=3, frame_bits=2, max_factor=2.0, min_len=2)
+    encoder = DiscEncoder(
+        key,
+        payload=6,
+        payload_bits=2,
+        n_positions=2,
+        context_mode="prefix_token_ngram",
+        context_width=3,
+        entropy_threshold=3.0,
+        seed=6,
+        use_cabs=True,
+        cabs_config=config,
+    )
+    probabilities = np.array([0.1, 0.2, 0.3, 0.4])
+    for _ in range(100):
+        encoder.encode_token(probabilities)
+
+    assert encoder.n_star_tokens is not None
+    assert encoder.n_star_tokens >= encoder.context_width
+    detector = DiscDetector(
+        key,
+        payload_bits=2,
+        n_positions=2,
+        context_mode="prefix_token_ngram",
+        context_width=3,
+        fpr=0.05,
+        use_cabs=True,
+        cabs_config=config,
+    )
+    result = detector.detect(
+        encoder.bits,
+        token_ids=encoder.tokens,
+        bit_length=2,
+        watermark_mask=encoder.watermark_mask,
+    )
+    assert result.detected
+    assert result.payload == 6
+    assert result.n_star == encoder.n_star
 
 
 def test_bit_ngram_context_round_trip():

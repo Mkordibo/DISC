@@ -12,9 +12,10 @@ Typical call::
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 
-from .core import DiscDetector, DiscEncoder, MessageMapping
+from .core import ContextMode, DiscDetector, DiscEncoder, MessageMapping
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,8 @@ class SimulationSummary:
     bit_error_rate: float
     message_accuracy: float
     detection_rate: float
+    generation_seconds: float
+    decoding_seconds: float
 
 
 def run_simulation(
@@ -50,12 +53,13 @@ def run_simulation(
     runs: int = 1000,
     payload_bits: int = 4,
     sequence_bits: int = 17 * 20,
-    context_width: int = 16,
+    context_width: int = 4,
     entropy_threshold: float = 5.0,
     fpr: float = 0.01,
     seed: int = 0,
     message_mapping: MessageMapping = "direct",
-    use_prefix: bool = True,
+    use_prefix: bool | None = None,
+    context_mode: ContextMode = "prefix_bit_ngram",
 ) -> SimulationSummary:
     """Simulate random Bernoulli conditionals as described in Section 5.
 
@@ -70,7 +74,7 @@ def run_simulation(
             ``context_width``. Example: ``340`` (= 17 bits × 20 tokens).
         context_width: n-gram length ``h`` in real tokens. For this Bernoulli
             simulation ``|V|=2`` so ``ceil(log2 |V|)=1`` and the binary
-            context is ``h`` bits. Example: ``16``.
+            context is ``h`` bits. Example: ``4``.
         entropy_threshold: Random-init stop in nats, ``float``. Example: ``5.0``.
         fpr: Detector false-positive target, ``float`` in ``(0, 1)``.
             Example: ``0.01``.
@@ -79,7 +83,10 @@ def run_simulation(
         message_mapping: ``"direct"`` or ``"gray"``. Applied to both encoder
             and detector.
         use_prefix: If False, encode/detect with ``R = []`` (no ``n_star``
-            search). Default True (paper random-init prefix).
+            search). ``None`` follows ``context_mode``: prefix modes use R;
+            non-prefix modes do not.
+        context_mode: PRF context representation used by both encoder and
+            detector. Raw Bernoulli bits act as one-token IDs in token modes.
 
     Returns:
         ``SimulationSummary`` with the six fields documented on that class.
@@ -92,6 +99,7 @@ def run_simulation(
         raise ValueError("runs must be positive and sequence_bits must exceed context_width")
     rng = random.Random(seed)
     bit_errors = correct = detected = 0  # ints accumulated over trials
+    generation_seconds = decoding_seconds = 0.0
     for run in range(runs):
         payload = rng.randrange(2**payload_bits)  # int in {0, ..., 2^m - 1}, e.g. 11
         encoder = DiscEncoder(
@@ -103,9 +111,13 @@ def run_simulation(
             seed=rng.randrange(2**63),  # int encoder RNG seed
             message_mapping=message_mapping,
             use_prefix=use_prefix,
+            context_mode=context_mode,
         )
+        generation_start = time.perf_counter()
         for _ in range(sequence_bits):
             encoder.encode_bit(rng.random())  # p_one is float Uniform(0, 1)
+        generation_seconds += time.perf_counter() - generation_start
+        decoding_start = time.perf_counter()
         result = DiscDetector(
             f"simulation-key-{run}",
             payload_bits,
@@ -113,7 +125,9 @@ def run_simulation(
             fpr=fpr,
             message_mapping=message_mapping,
             use_prefix=use_prefix,
+            context_mode=context_mode,
         ).detect(encoder.bits)  # bits: list[int] of length sequence_bits
+        decoding_seconds += time.perf_counter() - decoding_start
         detected += int(result.detected)  # 0 or 1
         decoded = result.payload if result.payload is not None else 0  # int
         # XOR bit count: Hamming distance between true and decoded payload.
@@ -128,4 +142,6 @@ def run_simulation(
         bit_errors / (runs * payload_bits),  # float BER
         correct / runs,  # float accuracy
         detected / runs,  # float detection rate
+        generation_seconds,
+        decoding_seconds,
     )

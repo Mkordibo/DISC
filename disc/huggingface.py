@@ -15,6 +15,7 @@ Typical types:
 
 from __future__ import annotations
 
+import importlib
 import math
 from collections.abc import Sequence
 
@@ -31,10 +32,12 @@ def _import_torch():
         ImportError: If PyTorch is not installed.
     """
     try:
-        import torch
+        # Resolve the optional package dynamically so importing ``disc`` does
+        # not require PyTorch and static analysis does not flag a missing local
+        # Hugging Face dependency at this source line.
+        return importlib.import_module("torch")
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise ImportError("Hugging Face generation requires: pip install -e '.[hf]'") from exc
-    return torch
 
 
 def generate(
@@ -131,6 +134,10 @@ def detect_token_ids(
     bits = token_ids_to_bits(token_ids, width)  # list[int] of 0/1, length = N * width
     if not detector.use_prefix:
         candidates = [0]
+    elif detector.context_mode == "prefix_token_ngram":
+        # Token-prefix detection searches R in real-token units. The core then
+        # converts a candidate k to its reported bit offset k * width.
+        candidates = range(1, len(token_ids))
     else:
         candidates = range(width, len(bits), width) if token_aligned_starts else None
     return detector.detect(

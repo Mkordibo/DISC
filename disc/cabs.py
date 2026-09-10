@@ -19,7 +19,7 @@ Example::
     from disc.cabs import CabsConfig, CabsScheduler
     from disc.core import HmacPrf
 
-    scheduler = CabsScheduler(HmacPrf("secret"), n_positions=4, context_width=5)
+    scheduler = CabsScheduler(HmacPrf("secret"), n_positions=4, context_width=4)
     positions = scheduler.assign_sequence([11, 7, 3, 9, 2, 8])
     # positions[t] is int in {0,1,2,3} or None if token t was ineligible
 """
@@ -75,8 +75,10 @@ class CabsScheduler:
     Args:
         prf: Object with ``uniform_tokens`` and ``integer_hash`` (``HmacPrf``).
         n_positions: ``H``, number of payload symbols. Example: ``4``.
-        context_width: ``h``, token n-gram length for Elig and tie-breaking.
-            Example: ``5``.
+        context_width: ``h``, real-token n-gram length for Elig and tie-breaking.
+            In DISC raw-bit mode, each real token is reconstructed from
+            ``w`` aligned bits, so this is equivalent to checking repeated
+            ``h * w`` bits without assigning positions bit by bit. Example: ``4``.
         config: Optional ``CabsConfig``. ``None`` uses paper defaults.
     """
 
@@ -84,7 +86,7 @@ class CabsScheduler:
         self,
         prf: _CabsPrf,
         n_positions: int,
-        context_width: int,
+        context_width: int = 4,
         config: CabsConfig | None = None,
     ):
         if n_positions < 1:
@@ -111,23 +113,42 @@ class CabsScheduler:
         self.seen: set[tuple[int, ...]] = set()  # h-grams already used to watermark
         self._pending: tuple[tuple[int, ...], int, int] | None = None
 
-    def propose(self, history: Sequence[int]) -> int | None:
+    def propose(
+        self,
+        history: Sequence[int],
+        *,
+        eligibility_context: Sequence[int] | None = None,
+    ) -> int | None:
         """Return a position for the next token, or None if it should not be watermarked.
 
         Args:
             history: Token IDs already generated, ``Sequence[int]``.
                 Example: ``[11, 7, 3, 9]``. Must *not* include the token being
                 sampled. Uses the last ``h`` IDs as context.
+            eligibility_context: Optional PRF context for the current DISC
+                decision. When supplied, CABS uses this sequence for repeated-
+                context eligibility and PRF tie-breaking. DISC bit modes pass
+                the preceding ``h*w`` bits; token modes pass ``h`` token IDs.
 
         Returns:
             ``int`` in ``{0, ..., H-1}`` if eligible, else ``None``.
             Warm-up (fewer than ``h`` tokens) and repeated h-grams are
             ineligible, matching ``Elig`` in Algorithm 1.
         """
-        if len(history) < self.context_width:
+        # MirrorMark's default uses the last h token IDs. DISC supplies an
+        # explicit context when its PRF uses a different representation.
+        context = (
+            tuple(history[-self.context_width :])
+            if eligibility_context is None
+            else tuple(eligibility_context)
+        )
+        if not context or (
+            eligibility_context is None and len(history) < self.context_width
+        ):
             self._pending = None
             return None
-        context = tuple(history[-self.context_width :])
+        # The seen set now tracks the exact PRF context that determines y, not
+        # necessarily the token history used for CABS frame bookkeeping.
         if context in self.seen:
             self._pending = None
             return None
@@ -162,21 +183,50 @@ class CabsScheduler:
             self.queue = []
             self.frame_len = 0
 
-    def assign_sequence(self, token_ids: Sequence[int]) -> list[int | None]:
+    def assign_sequence(
+        self,
+        token_ids: Sequence[int],
+        *,
+        start_index: int = 0,
+        eligibility_contexts: Sequence[Sequence[int] | None] | None = None,
+    ) -> list[int | None]:
         """Replay CABS over a finished token sequence.
 
         Args:
             token_ids: Full ID list, e.g. ``[11, 7, 3, 9, 2]``.
+            start_index: Number of leading tokens reserved as an unwatermarked
+                prefix R. These entries receive ``None`` and are used only as
+                history; CABS scheduling starts at this token index.
+            eligibility_contexts: Optional sequence parallel to ``token_ids``.
+                Each nonempty entry is the exact DISC PRF context used for
+                CABS eligibility at that token; ``None`` marks warm-up.
 
         Returns:
             ``list[int | None]`` of length ``len(token_ids)``. Index ``t`` is
             the position used while generating token ``t``, or ``None`` if
             that token was not watermarked.
         """
+        if not 0 <= start_index <= len(token_ids):
+            raise ValueError("start_index must lie between 0 and len(token_ids)")
+        if eligibility_contexts is not None and len(eligibility_contexts) != len(token_ids):
+            raise ValueError("eligibility_contexts must match token_ids length")
+        # Reset counts and frame state, but retain the complete token list as
+        # history so the first post-R eligibility test sees the same context
+        # that the encoder saw.
         self.reset()
         positions: list[int | None] = []
         for index, token_id in enumerate(token_ids):
-            positions.append(self.propose(token_ids[:index]))
+            if index < start_index:
+                # Prefix tokens are deliberately not proposed or committed:
+                # they cannot consume a CABS position, frame count, queue slot,
+                # or repeated-context entry.
+                positions.append(None)
+                continue
+            context = None if eligibility_contexts is None else eligibility_contexts[index]
+            if eligibility_contexts is not None and context is None:
+                positions.append(None)
+                continue
+            positions.append(self.propose(token_ids[:index], eligibility_context=context))
             self.commit(int(token_id))
         return positions
 
