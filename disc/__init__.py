@@ -21,6 +21,7 @@ from .core import (
     split_payload,
     token_ids_to_bits,
 )
+from .experiment import ExperimentConfig, build_record, load_prompts, parse_key
 
 __all__ = [
     "CabsConfig",
@@ -28,14 +29,18 @@ __all__ = [
     "DetectionResult",
     "DiscDetector",
     "DiscEncoder",
+    "ExperimentConfig",
     "HmacPrf",
     "bits_to_token_ids",
+    "build_record",
     "combine_p_values",
     "conditional_bit_probability",
     "disc_score",
     "gray_decode",
     "gray_encode",
     "join_payload",
+    "load_prompts",
+    "parse_key",
     "split_payload",
     "token_ids_to_bits",
 ]

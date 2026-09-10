@@ -1433,6 +1433,37 @@ class DiscEncoder:
         # occurs with exactly the configured ordinary-sampling probability.
         return selector >= 1.0 - (1.0 / self.randomization_window)
 
+    def _round_robin_position(self) -> int | None:
+        """Return the no-CABS position for the token containing the next bit.
+
+        CABS-off multi-position DISC assigns complete real tokens in a stable
+        round-robin order. Prefix-token mode starts that order after its
+        complete-token prefix R; bit-prefix mode intentionally counts from
+        token zero because R may end inside a token and the detector groups
+        that entire token by its original boundary.
+
+        Returns:
+            ``int`` in ``[0, n_positions)`` when a multi-position token can
+            be assigned, else ``None`` while token-prefix R is still open or
+            for the single-position configuration.
+        """
+        if self.n_positions == 1 or self.use_cabs:
+            return None
+        # During encode_token the current token is not in self.tokens yet.
+        # Raw encode_bit reconstructs its current real-token index from w.
+        token_index = (
+            len(self.tokens)
+            if self._in_token
+            else len(self.bits) // max(self.bits_per_token, 1)
+        )
+        if self.context_mode == "prefix_token_ngram":
+            # Until an entire token-prefix R has ended, this token is an
+            # ordinary sample and has no scheduling origin yet.
+            if self.n_star_tokens is None:
+                return None
+            token_index -= self.n_star_tokens
+        return token_index % self.n_positions
+
     def encode_bit(self, probability_one: float, *, watermark: bool = True, delta_m: float | None = None) -> int:
         """Sample the next binary token given P(bit = 1).
 
@@ -1473,6 +1504,12 @@ class DiscEncoder:
         # active. This also makes the invariant explicit to static checkers:
         # propose/commit are never called when the scheduler is absent.
         cabs_scheduler = self.cabs
+        # With H>1 and CABS disabled, encode and detect both assign entire
+        # real tokens deterministically. This is separate from CABS: no
+        # eligibility filtering, queue, frame state, or PRF tie-break occurs.
+        round_robin_position = self._round_robin_position()
+        if round_robin_position is not None and delta_m is None:
+            delta_m = self.position_deltas[round_robin_position]
         binary_cabs = (
             cabs_scheduler is not None
             and self.context_mode in ("prefix_bit_ngram", "bit_ngram")
@@ -1694,13 +1731,18 @@ class DiscEncoder:
         # Prefix tokens are ordinary LM samples and have no DISC position.  A
         # position is selected only once this token is after the completed R.
         prefix_active = self.use_prefix and self._needs_random_init()
-        position: int | None = (
-            None
-            if prefix_active or self.context_mode in ("prefix_bit_ngram", "bit_ngram")
-            else 0
-        )
+        # CABS-off H>1 uses one position for the entire real token. For a
+        # prefix-bit stream this is known even if R ends within the token;
+        # early R bits remain ordinary while later bits use this position.
+        position = self._round_robin_position()
+        if position is None and not prefix_active and self.context_mode not in (
+            "prefix_bit_ngram",
+            "bit_ngram",
+        ):
+            # Single-position legacy behavior retains the first symbol.
+            position = 0
         watermark = True
-        delta = self.delta_m
+        delta = self.delta_m if position is None else self.position_deltas[position]
         if (
             self.cabs is not None
             and self.context_mode not in ("prefix_bit_ngram", "bit_ngram")

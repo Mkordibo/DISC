@@ -17,6 +17,7 @@ experiments = ["matplotlib>=3.8"]
 
 [project.scripts]
 disc-simulate = "disc.cli:main"
+disc-experiment = "disc.experiment:main"
 
 [tool.setuptools.packages.find]
 include = ["disc*"]

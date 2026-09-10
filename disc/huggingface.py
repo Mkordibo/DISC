@@ -101,6 +101,77 @@ def generate(
     return tokenizer.decode(generated, skip_special_tokens=True), generated
 
 
+def generate_unwatermarked(
+    model,
+    tokenizer,
+    prompt: str,
+    *,
+    max_new_tokens: int = 128,
+    temperature: float = 1.0,
+    seed: int | None = None,
+) -> tuple[str, list[int]]:
+    """Sample an ordinary causal-LM continuation for a paired DISC control.
+
+    The model, tokenizer, prompt, length, and temperature have the same
+    format as :func:`generate`.  ``seed`` is an optional integer used only by
+    this control sampler.  The return value is ``(text, token_ids)`` where
+    ``text`` is the decoded continuation and ``token_ids`` contains only its
+    newly generated vocabulary IDs.  No DISC encoder, key, PRF, or watermark
+    decision is involved.
+    """
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    torch = _import_torch()
+    device = next(model.parameters()).device
+    encoded = tokenizer(prompt, return_tensors="pt")
+    input_ids = encoded["input_ids"].to(device)
+    # A per-call generator makes paired experiments reproducible without
+    # changing the caller's global PyTorch RNG state.
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+    generated: list[int] = []
+    past_key_values = None
+    model_input = input_ids
+    model.eval()
+    with torch.inference_mode():
+        for _ in range(max_new_tokens):
+            output = model(input_ids=model_input, past_key_values=past_key_values, use_cache=True)
+            past_key_values = output.past_key_values
+            probabilities = torch.softmax(output.logits[0, -1].float() / temperature, dim=-1)
+            token_id = int(torch.multinomial(probabilities, 1, generator=generator).item())
+            generated.append(token_id)
+            if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+                break
+            model_input = torch.tensor([[token_id]], device=device)
+    return tokenizer.decode(generated, skip_special_tokens=True), generated
+
+
+def perplexity_from_token_ids(model, token_ids: Sequence[int]) -> float:
+    """Return continuation perplexity for a nonempty sequence of token IDs.
+
+    Args:
+        model: Hugging Face causal LM used for generation.
+        token_ids: ``Sequence[int]`` of continuation IDs. At least two IDs
+            are required because causal-LM loss predicts the next ID.
+
+    Returns:
+        ``float`` perplexity, or ``float('nan')`` if fewer than two IDs are
+        supplied. This intentionally scores only the continuation, matching
+        MirrorMark's checkpoint output convention.
+    """
+    if len(token_ids) < 2:
+        return float("nan")
+    torch = _import_torch()
+    device = next(model.parameters()).device
+    ids = torch.tensor([list(token_ids)], dtype=torch.long, device=device)
+    model.eval()
+    with torch.inference_mode():
+        loss = model(input_ids=ids, labels=ids).loss
+    return float(torch.exp(loss).item())
+
+
 def detect_token_ids(
     token_ids: Sequence[int],
     vocab_size: int,

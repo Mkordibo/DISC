@@ -114,6 +114,71 @@ def test_cabs_disc_token_round_trip():
     assert result.symbols == (2, 3)
 
 
+def test_no_cabs_uses_matching_token_round_robin_positions():
+    key = "round-robin-token"
+    encoder = DiscEncoder(
+        key,
+        payload=11,  # m=2, H=2 -> symbols [2, 3]
+        payload_bits=2,
+        n_positions=2,
+        context_mode="token_ngram",
+        context_width=3,
+        seed=9,
+        use_cabs=False,
+    )
+    rng = np.random.default_rng(81)
+    for _ in range(300):
+        encoder.encode_token(rng.dirichlet(np.ones(4)))
+    assert encoder.token_positions[:6] == [0, 1, 0, 1, 0, 1]
+    result = DiscDetector(
+        key,
+        payload_bits=2,
+        n_positions=2,
+        context_mode="token_ngram",
+        context_width=3,
+        fpr=0.05,
+        use_cabs=False,
+    ).detect(encoder.bits, token_ids=encoder.tokens, bit_length=2)
+    assert result.detected
+    assert result.payload == 11
+
+
+def test_no_cabs_binary_round_robin_uses_whole_token_positions():
+    key = "round-robin-bits"
+    encoder = DiscEncoder(
+        key,
+        payload=6,  # m=2, H=2 -> symbols [1, 2]
+        payload_bits=2,
+        n_positions=2,
+        context_mode="prefix_bit_ngram",
+        context_width=4,
+        entropy_threshold=2.0,
+        seed=3,
+        use_cabs=False,
+    )
+    rng = np.random.default_rng(82)
+    for _ in range(1000):
+        encoder.encode_token(rng.dirichlet(np.ones(4)))
+    assert encoder.token_positions[:6] == [0, 1, 0, 1, 0, 1]
+    result = DiscDetector(
+        key,
+        payload_bits=2,
+        n_positions=2,
+        context_mode="prefix_bit_ngram",
+        context_width=4,
+        fpr=0.05,
+        use_cabs=False,
+    ).detect(
+        encoder.bits,
+        token_ids=encoder.tokens,
+        bit_length=2,
+        n_star_candidates=[encoder.n_star],
+        watermark_mask=encoder.watermark_mask,
+    )
+    assert result.detected
+    assert result.payload == 6
+
+
 def test_cabs_token_prefix_round_trip():
     key = "cabs-token-prefix"
     config = CabsConfig(window_size=3, frame_bits=2, max_factor=2.0, min_len=2)

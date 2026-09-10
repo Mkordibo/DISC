@@ -214,3 +214,28 @@ lands in a neighboring interval.
   `random` state is not used as a PRF.
 
 This is research code, not a production key-management or provenance system.
+## Paired Hugging Face experiments
+
+`disc-experiment` uses the same evaluation shape as the supplied MirrorMark
+driver: it accepts a prompt or a JSON list of prompts, produces paired
+watermarked and non-watermarked continuations, detects both at each requested
+checkpoint, and appends parallel JSONL files. DISC retains its HMAC PRF; a
+decimal or `0x`-prefixed `--secret-key` is parsed as DISC's existing integer
+key type, while any other value is a string key.
+
+```bash
+disc-experiment --llm-model openai-community/gpt2 \
+  --prompt "Explain statistical watermarking." \
+  --generation-num 1 --gen-len 200 --desired-checkpoints 100 200 \
+  --payload-bits 3 --positions 18 --context-width 4 \
+  --context-mode prefix_bit_ngram --save-dir generated_samples
+```
+
+The resulting files are named
+`watermark_m3_pos18_100tokens.jsonl` and
+`nonwatermark_m3_pos18_100tokens.jsonl` (and likewise for every checkpoint).
+Each row has MirrorMark's common fields (`idx`, `prompt`, `response`,
+`checkpoint_tokens`, `ppl`, `score`, `z`, `pvalue`, `time`, `step_stats`) plus
+DISC-specific decoded payload, `n_star`, scored-bit count, p-values, and the
+non-secret configuration. `z` is `null` because DISC uses an Erlang-tail
+p-value rather than MirrorMark's Gaussian z-score.
